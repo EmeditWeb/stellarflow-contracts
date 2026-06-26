@@ -53,8 +53,10 @@ pub mod consensus;
 pub mod math;
 pub mod staking_tiers;
 pub mod governance;
+pub mod fees;
 use crate::governance::{verify_staged_delay, StagedUpgrade};
 
+pub use fees::CorridorFeePool;
 pub use staking_tiers::{AssetFeedMetrics, StakingTier, StakingTierConfig};
 use staking_tiers::{
     assign_tier, effective_volume_score, required_stake_for_tier, validate_tier_config,
@@ -152,20 +154,6 @@ pub struct NodeProfile {
     pub rate: u64,
     pub confidence: u32,
     pub updated_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct CorridorFeePool {
-    pub asset: AssetId,
-    pub collected: u64,
-    pub variable_pool: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub enum CorridorFeeKey {
-    Asset(AssetId),
 }
 
 #[contracttype]
@@ -411,13 +399,14 @@ impl TimeLockedUpgradeContract {
         Ok(Self::_scan_profile_for_rate(profile).ok_or(ContractError::NotRegistered)?)
     }
 
-    pub fn add_corridor_fees(env: Env, asset: AssetId, collected: u64, variable_fee: u64) -> Result<CorridorFeePool, ContractError> {
-        let key = CorridorFeeKey::Asset(asset.clone());
-        let mut pool: CorridorFeePool = env.storage().persistent().get(&key).unwrap_or(CorridorFeePool { asset: asset.clone(), collected: 0, variable_pool: 0 });
-        pool.collected = pool.collected.checked_add(collected).ok_or(ContractError::Overflow)?;
-        pool.variable_pool = pool.variable_pool.checked_add(variable_fee).ok_or(ContractError::Overflow)?;
-        env.storage().persistent().set(&key, &pool);
-        Ok(pool)
+    pub fn add_corridor_fees(
+        env: Env,
+        admin: Address,
+        asset: AssetId,
+        collected: u64,
+        variable_fee: u64,
+    ) -> Result<CorridorFeePool, ContractError> {
+        crate::fees::add_corridor_fees(env, admin, asset, collected, variable_fee)
     }
 
     // ── Dynamic Staking Tier Assignment (Issue #300) ─────────────────────────
@@ -603,7 +592,7 @@ impl TimeLockedUpgradeContract {
     }
 
     pub fn get_corridor_fee_pool(env: Env, asset: AssetId) -> CorridorFeePool {
-        env.storage().persistent().get(&CorridorFeeKey::Asset(asset.clone())).unwrap_or(CorridorFeePool { asset, collected: 0, variable_pool: 0 })
+        crate::fees::get_corridor_fee_pool(env, asset)
     }
 
     pub fn set_platform_capital(env: Env, capital: u64) {
