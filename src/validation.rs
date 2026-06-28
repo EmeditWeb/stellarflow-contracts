@@ -12,7 +12,11 @@
 
 use soroban_sdk::{Address, Env, Map, Symbol};
 
-use crate::{ContractError, STAKE_REGISTRY_KEY};
+use crate::{
+    AssetId, ContractError, CorridorFeeKey, CorridorFeePool, StakingStorageKey,
+    STAKE_REGISTRY_KEY,
+};
+use crate::staking_tiers::AssetFeedMetrics;
 
 /// Minimum stake (in the same units as `StakeRecord.amount`) required to
 /// update a validator profile for a premium asset pool.
@@ -21,6 +25,56 @@ pub const PREMIUM_POOL_MIN_STAKE: u64 = 1_000;
 /// Maximum allowed age (in seconds) for an incoming telemetry payload's
 /// ledger timestamp before it is considered stale and rejected.
 pub const MAX_TELEMETRY_AGE_SECS: u64 = 60;
+
+/// Minimum cumulative pool/corridor volume required before telemetry derived
+/// from an AMM pool may update downstream exchange metrics.
+///
+/// This economic security floor rejects thinly backed pools whose spot prices
+/// are cheap to move with flash-loaned capital. The value uses the same units
+/// as `CorridorFeePool.collected`.
+pub const MIN_POOL_VOLUME_DEPTH: u64 = 1_000_000;
+
+/// Minimum normalized volume score for explicitly configured feed metrics.
+/// Scores below this value represent low-depth regional pools and must not be
+/// accepted as a source for exchange telemetry updates.
+pub const MIN_POOL_VOLUME_SCORE: u32 = 33;
+
+/// Evaluate whether an asset's underlying AMM/corridor has sufficient economic
+/// depth to safely accept telemetry updates.
+///
+/// The gate considers both on-chain cumulative pool activity and any configured
+/// feed volume score. A pool passes if either signal meets the minimum security
+/// threshold. This permits admins to bootstrap known-deep pools via metrics,
+/// while still rejecting assets whose stored/default metrics and corridor
+/// volume indicate a thin market.
+pub fn check_liquidity_depth(env: &Env, asset: AssetId) -> Result<(), ContractError> {
+    let corridor: CorridorFeePool = env
+        .storage()
+        .persistent()
+        .get(&CorridorFeeKey::Asset(asset))
+        .unwrap_or(CorridorFeePool {
+            asset,
+            collected: 0,
+            variable_pool: 0,
+        });
+
+    if corridor.collected >= MIN_POOL_VOLUME_DEPTH {
+        return Ok(());
+    }
+
+    let metrics: Option<AssetFeedMetrics> = env
+        .storage()
+        .persistent()
+        .get(&StakingStorageKey::AssetMetrics(asset));
+
+    if let Some(metrics) = metrics {
+        if metrics.volume_score >= MIN_POOL_VOLUME_SCORE {
+            return Ok(());
+        }
+    }
+
+    Err(ContractError::InsufficientLiquidityDepth)
+}
 
 /// Return the current locked stake for `node`, or 0 if unregistered.
 pub fn get_locked_stake(env: &Env, node: &Address) -> u64 {
