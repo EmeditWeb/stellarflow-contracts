@@ -4,6 +4,59 @@ use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, Symbol};
 pub(crate) const PENDING_OWNER_KEY: Symbol = symbol_short!("PNDOWN");
 pub(crate) const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 
+// ── Per-action admin nonce map ────────────────────────────────────────────────
+
+/// Discriminates which admin action's independent nonce sequence is being
+/// advanced.  Each variant carries its own isolated per-caller counter so that
+/// consuming a nonce for one action cannot accidentally satisfy or advance the
+/// counter for any other action.
+#[contracttype]
+#[derive(Clone)]
+pub enum AdminAction {
+    ProposeOwnershipTransfer,
+    ClaimOwnership,
+    SetPaused,
+    ProposeEmergencyRevocation,
+    VoteEmergencyRevocation,
+}
+
+/// Composite persistent-storage key that maps a `(caller, action)` pair to its
+/// current nonce value.  Stored in persistent storage so that nonce state
+/// survives TTL extensions and is never silently reset.
+#[contracttype]
+#[derive(Clone)]
+enum AdminNonceKey {
+    Action(Address, AdminAction),
+}
+
+/// Returns the next expected nonce for `caller` on the given `action`.
+/// Returns `0` when no nonce has been consumed yet for this pair.
+pub fn get_admin_action_nonce(env: &Env, caller: &Address, action: AdminAction) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&AdminNonceKey::Action(caller.clone(), action))
+        .unwrap_or(0u64)
+}
+
+/// Verifies that `incoming == expected` for this `(caller, action)` pair and
+/// atomically advances the stored counter to `expected + 1`.
+///
+/// Returns [`ContractError::InvalidNonce`] when the nonce does not match.
+fn consume_admin_nonce(
+    env: &Env,
+    caller: &Address,
+    action: AdminAction,
+    incoming: u64,
+) -> Result<(), ContractError> {
+    let key = AdminNonceKey::Action(caller.clone(), action);
+    let expected: u64 = env.storage().persistent().get(&key).unwrap_or(0u64);
+    if incoming != expected {
+        return Err(ContractError::InvalidNonce);
+    }
+    env.storage().persistent().set(&key, &(expected + 1u64));
+    Ok(())
+}
+
 // ── Emergency key revocation ─────────────────────────────────────────────
 
 pub(crate) const EMERGENCY_REVOCATION_KEY: Symbol = symbol_short!("EMERREV");
@@ -96,6 +149,7 @@ pub fn propose_emergency_revocation(
     proposer: Address,
     target: Address,
     replacement: Address,
+    nonce: u64,
 ) -> Result<(), ContractError> {
     let data: ContractData = env
         .storage()
@@ -114,6 +168,7 @@ pub fn propose_emergency_revocation(
         return Err(ContractError::Unauthorized);
     }
     proposer.require_auth();
+    consume_admin_nonce(env, &proposer, AdminAction::ProposeEmergencyRevocation, nonce)?;
 
     // Guard: only one active emergency proposal at a time.
     if env.storage().instance().has(&EMERGENCY_REVOCATION_KEY) {
@@ -167,6 +222,7 @@ pub fn vote_emergency_revocation(
     env: &Env,
     voter: Address,
     sig_expires_at: u64,
+    nonce: u64,
 ) -> Result<(), ContractError> {
     // Reject stale signatures up-front.
     if env.ledger().timestamp() > sig_expires_at {
@@ -186,6 +242,7 @@ pub fn vote_emergency_revocation(
     if data.admin != voter && !is_signer {
         return Err(ContractError::Unauthorized);
     }
+    consume_admin_nonce(env, &voter, AdminAction::VoteEmergencyRevocation, nonce)?;
 
     let mut proposal: EmergencyRevocationProposal = env
         .storage()
@@ -289,6 +346,7 @@ pub fn propose_ownership_transfer(
     env: &Env,
     current_admin: Address,
     nominee: Address,
+    nonce: u64,
 ) -> Result<(), ContractError> {
     let data: ContractData = env
         .storage()
@@ -300,6 +358,7 @@ pub fn propose_ownership_transfer(
         return Err(ContractError::NotAdmin);
     }
     current_admin.require_auth();
+    consume_admin_nonce(env, &current_admin, AdminAction::ProposeOwnershipTransfer, nonce)?;
 
     if env.storage().instance().has(&PENDING_OWNER_KEY) {
         return Err(ContractError::TransferAlreadyPending);
@@ -317,7 +376,7 @@ pub fn propose_ownership_transfer(
 
 /// Phase 2: nominee claims ownership, proving key access.
 /// Only succeeds when a pending transfer exists and caller is the nominee.
-pub fn claim_ownership(env: &Env, claimer: Address) -> Result<(), ContractError> {
+pub fn claim_ownership(env: &Env, claimer: Address, nonce: u64) -> Result<(), ContractError> {
     let pending: PendingOwner = env
         .storage()
         .instance()
@@ -328,6 +387,7 @@ pub fn claim_ownership(env: &Env, claimer: Address) -> Result<(), ContractError>
         return Err(ContractError::NotAdmin);
     }
     claimer.require_auth();
+    consume_admin_nonce(env, &claimer, AdminAction::ClaimOwnership, nonce)?;
 
     let mut data: ContractData = env
         .storage()
@@ -342,7 +402,7 @@ pub fn claim_ownership(env: &Env, claimer: Address) -> Result<(), ContractError>
 }
 
 /// Emergency stop: verified coordinator sets the global is_paused flag.
-pub fn set_paused(env: &Env, caller: Address, paused: bool) -> Result<(), ContractError> {
+pub fn set_paused(env: &Env, caller: Address, paused: bool, nonce: u64) -> Result<(), ContractError> {
     let data: ContractData = env
         .storage()
         .instance()
@@ -353,6 +413,7 @@ pub fn set_paused(env: &Env, caller: Address, paused: bool) -> Result<(), Contra
         return Err(ContractError::NotAdmin);
     }
     caller.require_auth();
+    consume_admin_nonce(env, &caller, AdminAction::SetPaused, nonce)?;
 
     env.storage().instance().set(&PAUSED_KEY, &paused);
     Ok(())

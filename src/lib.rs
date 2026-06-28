@@ -857,14 +857,15 @@ impl TimeLockedUpgradeContract {
         env: Env,
         current_admin: Address,
         nominee: Address,
+        nonce: u64,
     ) -> Result<(), ContractError> {
-        admin::propose_ownership_transfer(&env, current_admin, nominee)?;
+        admin::propose_ownership_transfer(&env, current_admin, nominee, nonce)?;
         Self::_extend_instance_ttl(&env);
         Ok(())
     }
 
-    pub fn claim_ownership(env: Env, claimer: Address) -> Result<(), ContractError> {
-        admin::claim_ownership(&env, claimer)?;
+    pub fn claim_ownership(env: Env, claimer: Address, nonce: u64) -> Result<(), ContractError> {
+        admin::claim_ownership(&env, claimer, nonce)?;
         Self::_extend_instance_ttl(&env);
         Ok(())
     }
@@ -878,8 +879,8 @@ impl TimeLockedUpgradeContract {
     }
 
     // #423: emergency pause controls
-    pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), ContractError> {
-        admin::set_paused(&env, caller, paused)
+    pub fn set_paused(env: Env, caller: Address, paused: bool, nonce: u64) -> Result<(), ContractError> {
+        admin::set_paused(&env, caller, paused, nonce)
     }
 
     pub fn is_paused(env: Env) -> bool {
@@ -927,10 +928,11 @@ impl TimeLockedUpgradeContract {
         proposer: Address,
         target: Address,
         replacement: Address,
+        nonce: u64,
     ) -> Result<(), ContractError> {
         // Guard: a revoked coordinator must not be able to open proposals.
         admin::assert_not_revoked(&env, &proposer)?;
-        admin::propose_emergency_revocation(&env, proposer, target, replacement)
+        admin::propose_emergency_revocation(&env, proposer, target, replacement, nonce)
     }
 
     /// Phase 2: any registered signer or the current admin casts a vote on
@@ -944,10 +946,18 @@ impl TimeLockedUpgradeContract {
         env: Env,
         voter: Address,
         sig_expires_at: u64,
+        nonce: u64,
     ) -> Result<(), ContractError> {
         // Guard: a revoked coordinator must not be allowed to vote.
         admin::assert_not_revoked(&env, &voter)?;
-        admin::vote_emergency_revocation(&env, voter, sig_expires_at)
+        admin::vote_emergency_revocation(&env, voter, sig_expires_at, nonce)
+    }
+
+    /// Returns the next expected action-nonce for `caller` on the given admin
+    /// `action`.  Clients must query this before constructing a transaction so
+    /// they can supply the correct value and avoid `InvalidNonce` errors.
+    pub fn get_admin_action_nonce(env: Env, caller: Address, action: admin::AdminAction) -> u64 {
+        admin::get_admin_action_nonce(&env, &caller, action)
     }
 
     /// Returns the active emergency revocation proposal, if one exists.
