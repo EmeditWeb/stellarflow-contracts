@@ -70,7 +70,9 @@ pub mod math;
 pub mod staking_tiers;
 pub mod storage;
 pub mod validation;
-use crate::validation::check_bond_capacity;
+use crate::validation::{
+    check_bond_capacity, process_price_bundle, AssetPriceUpdate, BundleValidationOutcome,
+};
 use crate::governance::{verify_staged_delay, StagedUpgrade};
 
 pub use staking_tiers::{AssetFeedMetrics, StakingTier, StakingTierConfig};
@@ -125,9 +127,15 @@ pub enum ContractError {
     /// The proposed fee exceeds the maximum allowed ceiling.
     FeeCeilingExceeded = 27,
     /// Incoming tracking sequence is less than or equal to the active stored checkpoint value.
-    StaleSequence = 26,
+    StaleSequence = 36,
+    /// Incoming telemetry payload timestamp exceeds the configured freshness threshold.
+    StaleTelemetryPayload = 35,
     /// A price-variance configuration field violated one or more struct invariants.
     InvalidVarianceConfig = 28,
+    /// The submitted price bundle exceeds the maximum allowed asset count.
+    BundleAssetLimitExceeded = 33,
+    /// A bundle update failed validation for one or more assets.
+    BundleValidationFailed = 34,
 }
 
 // Contract state keys
@@ -1071,6 +1079,23 @@ impl TimeLockedUpgradeContract {
 
         Self::_record_heartbeat(&env, symbol_to_asset_id(&pool));
         Ok(())
+    }
+
+    /// Process a bundled multi-asset price submission.
+    ///
+    /// Delegates to `validation::process_price_bundle` for gas-throttled
+    /// single-pass linear scanning with pre-calculated key index pointers.
+    /// Available as a public contract method for off-chain callers and
+    /// integration tests.
+    pub fn update_prices_bundle(
+        env: Env,
+        node: Address,
+        updates: Vec<AssetPriceUpdate>,
+    ) -> Result<BundleValidationOutcome, ContractError> {
+        node.require_auth();
+        let outcome = process_price_bundle(&env, &node, &updates)?;
+        Self::_extend_instance_ttl(&env);
+        Ok(outcome)
     }
 }
 
