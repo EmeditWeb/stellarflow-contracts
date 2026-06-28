@@ -1,11 +1,7 @@
 use soroban_sdk::{Address, Env, Map, Vec};
 use crate::{ContractData, ContractError, DATA_KEY, SIGNERS_KEY, VALIDATOR_STATE_KEY};
 
-// Bit positions for ValidatorState mask
-const ONLINE: u32 = 1 << 0;
 const ACTIVE: u32 = 1 << 1;
-const SUSPENDED: u32 = 1 << 2;
-const JAILED: u32 = 1 << 3;
 
 fn get_validator_state(env: &Env, addr: &Address) -> u32 {
     let states: Map<Address, u32> = env
@@ -16,25 +12,14 @@ fn get_validator_state(env: &Env, addr: &Address) -> u32 {
     states.get(addr.clone()).unwrap_or(0u32)
 }
 
-fn set_validator_flag(env: &Env, addr: &Address, flag: u32, value: bool) {
-    let mut states: Map<Address, u32> = env
-        .storage()
-        .instance()
-        .get(&VALIDATOR_STATE_KEY)
-        .unwrap_or_else(|| Map::new(env));
-    let current = states.get(addr.clone()).unwrap_or(0u32);
-    let updated = if value { current | flag } else { current & !flag };
-    states.set(addr.clone(), updated);
-    env.storage().instance().set(&VALIDATOR_STATE_KEY, &states);
-}
-
-fn has_validator_flag(env: &Env, addr: &Address, flag: u32) -> bool {
-    get_validator_state(env, addr) & flag != 0
-}
-
-/// Rigid multi-signature confirmation barrier for parameter shift actions.
-/// Requires a supermajority of 4 out of 5 validated administrative signatures
-/// before approving changes to system boundary configurations.
+/// Multi-signature consensus approval for cross-border parameter changes.
+///
+/// Issue #539: requires at least 2 unique, active, authorized participants
+/// before a cross-border parameter change is committed.  The admin counts
+/// as one participant (already authorized by the caller); additional signers
+/// from the registered signer set make up the remainder.
+///
+/// Duplicates are filtered via a Map.  Unregistered addresses are ignored.
 pub fn require_multisig(env: &Env, signers: &Vec<Address>) -> Result<(), ContractError> {
     let authorized_signers: Map<Address, ()> = env
         .storage()
@@ -48,37 +33,40 @@ pub fn require_multisig(env: &Env, signers: &Vec<Address>) -> Result<(), Contrac
         .get(&DATA_KEY)
         .ok_or(ContractError::NotInitialized)?;
 
+    let mut seen: Map<Address, ()> = Map::new(env);
     let mut valid_count = 0u32;
 
-    for (idx, signer) in signers.iter().enumerate() {
-        // Avoid repeated signature validation for duplicate signers in the same request.
-        if signers.iter().take(idx).any(|previous| previous == signer) {
+    for i in 0..signers.len() {
+        let signer = signers.get(i).unwrap();
+
+        if seen.contains_key(signer.clone()) {
+            continue;
+        }
+        seen.set(signer.clone(), ());
+
+        let is_registered = authorized_signers.contains_key(signer.clone())
+            || data.admin == signer;
+        if !is_registered {
             continue;
         }
 
         let state = get_validator_state(env, &signer);
-        let is_authorized = (authorized_signers.contains_key(signer.clone()) || data.admin == *signer)
-            && (state & ACTIVE) != 0;
-        if !is_authorized {
+        let is_active = state == 0 || (state & ACTIVE) != 0;
+        if !is_active {
             continue;
         }
 
-        signer.require_auth();
-        valid_count += 1;
-        set_validator_flag(env, &signer, ONLINE, true);
-
-        if valid_count >= 2 {
-            break;
+        // The admin's auth is already consumed by the outer function before
+        // require_multisig is called — do not call require_auth again or the
+        // host will abort with a double-auth error.
+        if signer != data.admin {
+            signer.require_auth();
         }
+
+        valid_count += 1;
     }
 
-    // Clear ONLINE flags for all signers after the check completes
-    for signer in signers.iter() {
-        set_validator_flag(env, &signer, ONLINE, false);
-    }
-
-    // Require a supermajority of 4 out of 5 validated administrative signatures
-    if valid_count < 4 {
+    if valid_count < 2 {
         return Err(ContractError::ThresholdNotReached);
     }
 

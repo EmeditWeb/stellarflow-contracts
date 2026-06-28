@@ -607,7 +607,10 @@ fn test_regional_feed_allows_lower_stake_than_premier_feed() {
     let regional: AssetId = 2654435761; // KES
     let premier: AssetId = 3897123275; // NGN
 
-    let signers = soroban_sdk::vec![&env, admin.clone(), admin.clone()];
+    // Issue #539: need 2 valid signers; register one alongside admin.
+    let signer_a = soroban_sdk::Address::generate(&env);
+    client.register_signer(&signer_a, &admin);
+    let signers = soroban_sdk::vec![&env, admin.clone(), signer_a.clone()];
     client.set_asset_feed_metrics(&admin, &regional, &10, &100, &signers);
     client.set_asset_feed_metrics(&admin, &premier, &80, &1_000, &signers);
 
@@ -642,17 +645,20 @@ fn test_corridor_volume_bumps_tier_requirements() {
     client.initialize(&admin, &treasury);
 
     let asset: AssetId = 4026531840; // GHS
+    // Issue #539: register a second signer for multi-sig consensus.
+    let signer_a = soroban_sdk::Address::generate(&env);
+    client.register_signer(&signer_a, &admin);
     client.set_asset_feed_metrics(
         &admin,
         &asset,
         &10,
         &200,
-        &soroban_sdk::vec![&env, admin.clone()],
+        &soroban_sdk::vec![&env, admin.clone(), signer_a],
     );
 
     assert_eq!(client.get_staking_tier(&asset), StakingTier::Regional);
 
-    client.add_corridor_fees(&admin, &asset, &2_000_000_000u64, &0u64);
+    client.add_corridor_fees(&asset, &2_000_000_000u64, &0u64);
 
     assert_eq!(client.get_staking_tier(&asset), StakingTier::Standard);
     assert_eq!(client.get_required_stake(&asset), 1_000u64);
@@ -670,7 +676,10 @@ fn test_custom_tier_config_is_enforced() {
     let treasury = soroban_sdk::Address::generate(&env);
     client.initialize(&admin, &treasury);
 
-    let signers = soroban_sdk::vec![&env, admin.clone(), admin.clone()];
+    // Issue #539: register a second signer for multi-sig consensus.
+    let signer_a = soroban_sdk::Address::generate(&env);
+    client.register_signer(&signer_a, &admin);
+    let signers = soroban_sdk::vec![&env, admin.clone(), signer_a.clone()];
     client.set_staking_tier_config(
         &admin,
         &StakingTierConfig {
@@ -706,12 +715,15 @@ fn test_unstake_from_feed_updates_totals() {
     client.initialize(&admin, &treasury);
 
     let asset: AssetId = 2863311530; // UGX
+    // Issue #539: register a second signer for multi-sig consensus.
+    let signer_a = soroban_sdk::Address::generate(&env);
+    client.register_signer(&signer_a, &admin);
     client.set_asset_feed_metrics(
         &admin,
         &asset,
         &10,
         &100,
-        &soroban_sdk::vec![&env, admin.clone()],
+        &soroban_sdk::vec![&env, admin.clone(), signer_a],
     );
     client.stake_and_register_for_feed(&node, &asset, &100u64);
 
@@ -1202,4 +1214,123 @@ fn test_replacement_signer_promoted_on_revocation() {
     // is recognised as a valid participant.
     let result = client.try_vote_emergency_revocation(&replacement, &u64::MAX);
     assert_eq!(result, Err(Ok(ContractError::NoActiveEmergencyRevocation)));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Issue #539 — Multi-Signature Consensus Approvals for Cross-Border Parameter
+// Changes
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Helper: set up a contract with admin + n registered signers.
+/// Returns (env, client, admin, signers).
+fn setup_multisig(
+    n: usize,
+) -> (
+    soroban_sdk::Env,
+    TimeLockedUpgradeContractClient<'static>,
+    soroban_sdk::Address,
+    soroban_sdk::Vec<soroban_sdk::Address>,
+) {
+    let env = soroban_sdk::Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let treasury = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &treasury);
+
+    let mut signers = soroban_sdk::Vec::new(&env);
+    for _ in 0..n {
+        let s = soroban_sdk::Address::generate(&env);
+        client.register_signer(&s, &admin);
+        signers.push_back(s);
+    }
+    (env, client, admin, signers)
+}
+
+#[test]
+fn test_multisig_set_staking_tier_config_requires_two_signers() {
+    // Admin alone (1 signer) should be rejected; admin + signer_a (2) passes.
+    let (env, client, admin, signers) = setup_multisig(1);
+    let signer_a = signers.get(0).unwrap();
+
+    let config = StakingTierConfig {
+        regional_min_stake: 100,
+        standard_min_stake: 1_000,
+        premier_min_stake: 10_000,
+    };
+
+    // One-signer list → ThresholdNotReached
+    let one = soroban_sdk::vec![&env, admin.clone()];
+    let result = client.try_set_staking_tier_config(&admin, &config.clone(), &one);
+    assert_eq!(result, Err(Ok(ContractError::ThresholdNotReached)));
+
+    // Two signers: admin + signer_a → success
+    let two = soroban_sdk::vec![&env, admin.clone(), signer_a];
+    client.set_staking_tier_config(&admin, &config, &two);
+    let stored = client.get_staking_tier_config();
+    assert_eq!(stored.regional_min_stake, 100);
+    assert_eq!(stored.premier_min_stake, 10_000);
+}
+
+#[test]
+fn test_multisig_set_asset_feed_metrics_requires_two_signers() {
+    let (env, client, admin, signers) = setup_multisig(1);
+    let signer_a = signers.get(0).unwrap();
+    let asset: crate::AssetId = 3897123275; // NGN
+
+    // One-signer list → ThresholdNotReached
+    let one = soroban_sdk::vec![&env, admin.clone()];
+    let result = client.try_set_asset_feed_metrics(&admin, &asset, &20, &300, &one);
+    assert_eq!(result, Err(Ok(ContractError::ThresholdNotReached)));
+
+    // Two signers → success
+    let two = soroban_sdk::vec![&env, admin.clone(), signer_a];
+    let metrics = client.set_asset_feed_metrics(&admin, &asset, &20, &300, &two);
+    assert_eq!(metrics.volume_score, 20);
+}
+
+#[test]
+fn test_multisig_deduplicates_repeated_signers() {
+    // Passing the same signer twice must not count as two approvals.
+    let (env, client, admin, _) = setup_multisig(0);
+    let config = StakingTierConfig {
+        regional_min_stake: 100,
+        standard_min_stake: 1_000,
+        premier_min_stake: 10_000,
+    };
+
+    // admin appears twice — must still count as 1 unique signer → rejected
+    let dup = soroban_sdk::vec![&env, admin.clone(), admin.clone()];
+    let result = client.try_set_staking_tier_config(&admin, &config, &dup);
+    assert_eq!(result, Err(Ok(ContractError::ThresholdNotReached)));
+}
+
+#[test]
+fn test_multisig_unregistered_signer_not_counted() {
+    let (env, client, admin, _) = setup_multisig(0);
+    let stranger = soroban_sdk::Address::generate(&env);
+    let config = StakingTierConfig {
+        regional_min_stake: 100,
+        standard_min_stake: 1_000,
+        premier_min_stake: 10_000,
+    };
+
+    // Admin + unregistered stranger → still only 1 valid signer
+    let mixed = soroban_sdk::vec![&env, admin.clone(), stranger];
+    let result = client.try_set_staking_tier_config(&admin, &config, &mixed);
+    assert_eq!(result, Err(Ok(ContractError::ThresholdNotReached)));
+}
+
+#[test]
+fn test_multisig_exactly_two_valid_signers_accepted() {
+    let (env, client, admin, signers) = setup_multisig(2);
+    let signer_a = signers.get(0).unwrap();
+    let asset: crate::AssetId = 2654435761; // KES
+
+    // admin + signer_a = 2 distinct valid signers, threshold met
+    let two = soroban_sdk::vec![&env, admin.clone(), signer_a];
+    let metrics = client.set_asset_feed_metrics(&admin, &asset, &50, &500, &two);
+    assert_eq!(metrics.volume_score, 50);
 }

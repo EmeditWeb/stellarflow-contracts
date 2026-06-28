@@ -316,85 +316,100 @@ mod tests {
 
     #[test]
     fn get_returns_default_before_any_set() {
+        use crate::TimeLockedUpgradeContract;
         let env = soroban_sdk::Env::default();
-        let cfg = get_price_variance_config(&env);
-        assert_eq!(cfg, PriceVarianceConfig::default());
+        let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+        env.as_contract(&contract_id, || {
+            let cfg = get_price_variance_config(&env);
+            assert_eq!(cfg, PriceVarianceConfig::default());
+        });
     }
 
     #[test]
     fn set_and_get_round_trips_full_struct() {
+        use crate::TimeLockedUpgradeContract;
         use soroban_sdk::testutils::Address as _;
         use soroban_sdk::Address;
 
         let env = soroban_sdk::Env::default();
         env.mock_all_auths();
+        let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
 
-        // Bootstrap contract state so `set_price_variance_config` can read DATA_KEY.
-        let admin = Address::generate(&env);
-        let data = crate::ContractData {
-            admin: admin.clone(),
-            value: 0,
-        };
-        env.storage().instance().set(&DATA_KEY, &data);
+        env.as_contract(&contract_id, || {
+            let admin = Address::generate(&env);
+            let data = crate::ContractData {
+                admin: admin.clone(),
+                value: 0,
+            };
+            env.storage().instance().set(&DATA_KEY, &data);
 
-        let custom = PriceVarianceConfig {
-            max_spread_bps: 150,
-            max_deviation_bps: 400,
-            min_submission_count: 5,
-            max_submission_age_secs: 120,
-        };
+            let custom = PriceVarianceConfig {
+                max_spread_bps: 150,
+                max_deviation_bps: 400,
+                min_submission_count: 5,
+                max_submission_age_secs: 120,
+            };
 
-        set_price_variance_config(&env, &admin, custom.clone())
-            .expect("set should succeed with valid config");
+            set_price_variance_config(&env, &admin, custom.clone())
+                .expect("set should succeed with valid config");
 
-        let retrieved = get_price_variance_config(&env);
-        assert_eq!(retrieved, custom);
+            let retrieved = get_price_variance_config(&env);
+            assert_eq!(retrieved, custom);
+        });
     }
 
     #[test]
     fn set_rejects_non_admin_caller() {
+        use crate::TimeLockedUpgradeContract;
         use soroban_sdk::testutils::Address as _;
         use soroban_sdk::Address;
 
         let env = soroban_sdk::Env::default();
         env.mock_all_auths();
+        let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
 
-        let admin = Address::generate(&env);
-        let intruder = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            let admin = Address::generate(&env);
+            let intruder = Address::generate(&env);
 
-        let data = crate::ContractData {
-            admin: admin.clone(),
-            value: 0,
-        };
-        env.storage().instance().set(&DATA_KEY, &data);
+            let data = crate::ContractData {
+                admin: admin.clone(),
+                value: 0,
+            };
+            env.storage().instance().set(&DATA_KEY, &data);
 
-        let result =
-            set_price_variance_config(&env, &intruder, PriceVarianceConfig::default());
-        assert_eq!(result, Err(ContractError::NotAdmin));
+            let result =
+                set_price_variance_config(&env, &intruder, PriceVarianceConfig::default());
+            assert_eq!(result, Err(ContractError::NotAdmin));
+        });
     }
 
     #[test]
     fn set_rejects_invalid_config() {
+        use crate::TimeLockedUpgradeContract;
         use soroban_sdk::testutils::Address as _;
         use soroban_sdk::Address;
 
         let env = soroban_sdk::Env::default();
         env.mock_all_auths();
+        let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
 
-        let admin = Address::generate(&env);
-        let data = crate::ContractData {
-            admin: admin.clone(),
-            value: 0,
-        };
-        env.storage().instance().set(&DATA_KEY, &data);
+        env.as_contract(&contract_id, || {
+            let admin = Address::generate(&env);
+            let data = crate::ContractData {
+                admin: admin.clone(),
+                value: 0,
+            };
+            env.storage().instance().set(&DATA_KEY, &data);
 
-        let bad = PriceVarianceConfig {
-            max_spread_bps: 0, // violates lower-bound invariant
-            ..PriceVarianceConfig::default()
-        };
-        assert_eq!(
-            set_price_variance_config(&env, &admin, bad),
-            Err(ContractError::InvalidVarianceConfig)
-        );
+            let bad = PriceVarianceConfig {
+                max_spread_bps: 0, // violates lower-bound invariant
+                ..PriceVarianceConfig::default()
+            };
+            assert_eq!(
+                set_price_variance_config(&env, &admin, bad),
+                Err(ContractError::InvalidVarianceConfig)
+            );
+        });
     }
 }
