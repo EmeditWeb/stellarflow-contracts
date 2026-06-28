@@ -3097,9 +3097,11 @@ impl PriceOracle {
 mod asset_symbol;
 mod auth;
 mod callbacks;
+pub mod fees;
 pub mod math;
 mod median;
 mod role_registry;
 mod slashing;
+pub mod storage;
 mod test;
 mod types;

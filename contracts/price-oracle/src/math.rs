@@ -98,6 +98,50 @@ use crate::Error;
 //     String::from_bytes(env, &out[..pos])
 // }
 
+/// Compute the integer geometric mean of two non-negative scaled integers.
+///
+/// Uses an iterative bit-shifting (Newton–Raphson) square-root to avoid
+/// floating-point arithmetic, preserving correctness across illiquid asset
+/// corridors where an arithmetic mean would skew multi-hop trade prices
+/// (closes #526).
+///
+/// Both inputs are assumed to share the same decimal scale.  The result is
+/// returned at the same scale.
+///
+/// Returns `None` if either input is negative or if the product overflows
+/// `u128`.
+pub fn geometric_mean(a: i128, b: i128) -> Option<i128> {
+    if a < 0 || b < 0 {
+        return None;
+    }
+    let a = a as u128;
+    let b = b as u128;
+    let product = a.checked_mul(b)?;
+
+    // Integer square-root via bit-shifting Newton–Raphson (no floats).
+    if product == 0 {
+        return Some(0);
+    }
+
+    // Initial estimate: shift right by half the bit length.
+    let mut x = product >> (product.leading_zeros() as u128 / 2 + 1).min(63);
+    if x == 0 {
+        x = 1;
+    }
+    loop {
+        let x1 = (x + product / x) >> 1;
+        if x1 >= x {
+            break;
+        }
+        x = x1;
+    }
+    // Verify that x is the floor of sqrt(product).
+    if x * x > product {
+        x -= 1;
+    }
+    i128::try_from(x).ok()
+}
+
 pub fn normalize_to_seven(value: i128, input_decimals: u32) -> Result<i128, Error> {
     if input_decimals < 7 {
         let diff = 7 - input_decimals;
@@ -221,7 +265,38 @@ mod tests {
         assert_eq!(s.to_string(), "-750.50");
     }
 
-    // --- normalize_to_seven tests ---------------------------------------------
+    // --- geometric_mean tests ------------------------------------------------
+
+    #[test]
+    fn test_geometric_mean_equal_values() {
+        // sqrt(100 * 100) = 100
+        assert_eq!(geometric_mean(100, 100), Some(100));
+    }
+
+    #[test]
+    fn test_geometric_mean_different_values() {
+        // sqrt(4 * 9) = sqrt(36) = 6
+        assert_eq!(geometric_mean(4, 9), Some(6));
+    }
+
+    #[test]
+    fn test_geometric_mean_zero() {
+        assert_eq!(geometric_mean(0, 1000), Some(0));
+        assert_eq!(geometric_mean(1000, 0), Some(0));
+    }
+
+    #[test]
+    fn test_geometric_mean_negative_returns_none() {
+        assert_eq!(geometric_mean(-1, 100), None);
+        assert_eq!(geometric_mean(100, -1), None);
+    }
+
+    #[test]
+    fn test_geometric_mean_scaled_prices() {
+        // sqrt(1_000_000 * 4_000_000) = sqrt(4_000_000_000_000) = 2_000_000
+        assert_eq!(geometric_mean(1_000_000, 4_000_000), Some(2_000_000));
+    }
+
 
     #[test]
     fn test_normalize_to_seven_scale_up() {
