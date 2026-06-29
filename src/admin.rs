@@ -3,6 +3,92 @@ use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, Symbol};
 
 pub(crate) const PENDING_OWNER_KEY: Symbol = symbol_short!("PNDOWN");
 pub(crate) const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
+pub(crate) const PENDING_ADMIN_CHANGE_KEY: Symbol = symbol_short!("PADMCHG");
+
+/// 24-hour delay between proposing and applying an admin system change.
+pub(crate) const ADMIN_CHANGE_DELAY: u64 = 24 * 60 * 60;
+
+// ── Two-phase admin adjustment (24-hour timelock) ─────────────────────────
+
+/// Pending admin system-state change, locked for 24 hours before activation.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingAdminChange {
+    /// Address of the admin proposing the change.
+    pub proposer: Address,
+    /// New value to apply to the contract state.
+    pub new_value: u64,
+    /// Ledger timestamp when the change was proposed.
+    pub proposed_at: u64,
+}
+
+/// Phase 1: Admin proposes a system-state change.
+/// The change is stored in pending state and cannot be applied for 24 hours.
+pub fn propose_admin_change(
+    env: &Env,
+    admin: Address,
+    new_value: u64,
+) -> Result<(), ContractError> {
+    let data: ContractData = env
+        .storage()
+        .instance()
+        .get(&DATA_KEY)
+        .ok_or(ContractError::NotInitialized)?;
+
+    if data.admin != admin {
+        return Err(ContractError::NotAdmin);
+    }
+    admin.require_auth();
+
+    if env.storage().instance().has(&PENDING_ADMIN_CHANGE_KEY) {
+        return Err(ContractError::AdminChangePending);
+    }
+
+    env.storage().instance().set(
+        &PENDING_ADMIN_CHANGE_KEY,
+        &PendingAdminChange {
+            proposer: admin,
+            new_value,
+            proposed_at: env.ledger().timestamp(),
+        },
+    );
+    Ok(())
+}
+
+/// Phase 2: Admin applies the pending system-state change after 24 hours.
+pub fn apply_admin_change(env: &Env, admin: Address) -> Result<(), ContractError> {
+    let data: ContractData = env
+        .storage()
+        .instance()
+        .get(&DATA_KEY)
+        .ok_or(ContractError::NotInitialized)?;
+
+    if data.admin != admin {
+        return Err(ContractError::NotAdmin);
+    }
+    admin.require_auth();
+
+    let pending: PendingAdminChange = env
+        .storage()
+        .instance()
+        .get(&PENDING_ADMIN_CHANGE_KEY)
+        .ok_or(ContractError::NoAdminChangePending)?;
+
+    if env.ledger().timestamp() < pending.proposed_at + ADMIN_CHANGE_DELAY {
+        return Err(ContractError::AdminChangeTimelockActive);
+    }
+
+    let mut new_data = data;
+    new_data.value = pending.new_value;
+    env.storage().instance().set(&DATA_KEY, &new_data);
+    env.storage().instance().remove(&PENDING_ADMIN_CHANGE_KEY);
+    Ok(())
+}
+
+/// Returns the pending admin change proposal, if one exists.
+pub fn get_pending_admin_change(env: &Env) -> Option<PendingAdminChange> {
+    env.storage().instance().get(&PENDING_ADMIN_CHANGE_KEY)
+}
 
 // ── Emergency key revocation ─────────────────────────────────────────────
 

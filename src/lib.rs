@@ -128,6 +128,12 @@ pub enum ContractError {
     StaleSequence = 26,
     /// A price-variance configuration field violated one or more struct invariants.
     InvalidVarianceConfig = 28,
+    /// An admin change proposal is already pending.
+    AdminChangePending = 33,
+    /// No admin change proposal is currently pending.
+    NoAdminChangePending = 34,
+    /// The 24-hour delay for the admin change has not yet elapsed.
+    AdminChangeTimelockActive = 35,
 }
 
 // Contract state keys
