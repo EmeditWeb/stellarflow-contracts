@@ -652,7 +652,7 @@ fn test_corridor_volume_bumps_tier_requirements() {
 
     assert_eq!(client.get_staking_tier(&asset), StakingTier::Regional);
 
-    client.add_corridor_fees(&admin, &asset, &2_000_000_000u64, &0u64);
+    client.add_corridor_fees(&asset, &2_000_000_000u64, &0u64);
 
     assert_eq!(client.get_staking_tier(&asset), StakingTier::Standard);
     assert_eq!(client.get_required_stake(&asset), 1_000u64);
@@ -1202,4 +1202,46 @@ fn test_replacement_signer_promoted_on_revocation() {
     // is recognised as a valid participant.
     let result = client.try_vote_emergency_revocation(&replacement, &u64::MAX);
     assert_eq!(result, Err(Ok(ContractError::NoActiveEmergencyRevocation)));
+}
+
+#[test]
+fn test_storage_rent_expiry() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let node = soroban_sdk::Address::generate(&env);
+    let treasury = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &treasury);
+
+    let asset: AssetId = 2863311530; // UGX
+    client.set_asset_feed_metrics(
+        &admin,
+        &asset,
+        &10,
+        &100,
+        &soroban_sdk::vec![&env, admin.clone()],
+    );
+
+    // Node registers and stakes 100u64
+    client.stake_and_register_for_feed(&node, &asset, &100u64);
+
+    // Initial check - stake should be active
+    assert_eq!(client.get_feed_stake(&node, &asset), 100u64);
+    assert_eq!(client.get_total_staked(), 100u64);
+
+    // Advance timestamp by exactly RENT_THRESHOLD (259_200 seconds)
+    // At exactly RENT_THRESHOLD, it should still be active/valid
+    advance_ledger_timestamp(&env, 259_200);
+    assert_eq!(client.get_feed_stake(&node, &asset), 100u64);
+
+    // Advance timestamp by 1 more second (259_201 seconds total elapsed since register/update)
+    advance_ledger_timestamp(&env, 1);
+
+    // Now it should be pruned/expired and return 0 stake
+    assert_eq!(client.get_feed_stake(&node, &asset), 0u64);
+    // Total staked should also reflect the pruning
+    assert_eq!(client.get_total_staked(), 0u64);
 }

@@ -124,18 +124,21 @@ pub enum ContractError {
     DivisionByZero = 26,
     /// The proposed fee exceeds the maximum allowed ceiling.
     FeeCeilingExceeded = 27,
-    /// Incoming tracking sequence is less than or equal to the active stored checkpoint value.
-    StaleSequence = 26,
     /// A price-variance configuration field violated one or more struct invariants.
     InvalidVarianceConfig = 28,
+    /// Incoming tracking sequence is less than or equal to the active stored checkpoint value.
+    StaleSequence = 33,
+    /// Incoming telemetry payload timestamp is older than the maximum
+    /// allowed age (60 seconds behind the current ledger block time).
+    StaleTelemetryPayload = 34,
 }
 
 // Contract state keys
 pub(crate) const DATA_KEY: Symbol = symbol_short!("DATA");
 const PENDING_UPGRADE_KEY: Symbol = symbol_short!("PENDING");
 pub(crate) const UPGRADE_DELAY_SECONDS: u64 = 48 * 60 * 60;
-const STAKE_REGISTRY_KEY: Symbol = symbol_short!("STAKES");
-const TOTAL_STAKED_KEY: Symbol = symbol_short!("TOTAL");
+pub(crate) const STAKE_REGISTRY_KEY: Symbol = symbol_short!("STAKES");
+pub(crate) const TOTAL_STAKED_KEY: Symbol = symbol_short!("TOTAL");
 const HEARTBEAT_KEY: Symbol = symbol_short!("HBEAT");
 const HB_INTERVAL_KEY: Symbol = symbol_short!("HBINTV");
 pub(crate) const DEFAULT_HEARTBEAT_INTERVAL: u64 = 5 * 60;
@@ -729,7 +732,12 @@ impl TimeLockedUpgradeContract {
             return Err(ContractError::InsufficientStakeForTier);
         }
 
-        env.storage().persistent().set(&feed_key, &amount);
+        let stake_val = storage::FeedStakeValue {
+            amount,
+            last_active: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&feed_key, &stake_val);
+        env.storage().persistent().extend_ttl(&feed_key, storage::RENT_THRESHOLD, storage::RENT_EXTEND_TO);
 
         let mut stakes: Map<Address, u64> = env
             .storage()
@@ -767,11 +775,12 @@ impl TimeLockedUpgradeContract {
         node.require_auth();
 
         let feed_key = StakingStorageKey::FeedStake(node.clone(), asset);
-        let amount: u64 = env
+        let stake_val: storage::FeedStakeValue = env
             .storage()
             .persistent()
             .get(&feed_key)
             .ok_or(ContractError::NotRegistered)?;
+        let amount = stake_val.amount;
 
         env.storage().persistent().remove(&feed_key);
 
@@ -803,10 +812,13 @@ impl TimeLockedUpgradeContract {
 
     /// Return the collateral posted by a node for a specific currency feed.
     pub fn get_feed_stake(env: Env, node: Address, asset: AssetId) -> u64 {
-        env.storage()
+        storage::check_and_prune_feed_stake(&env, node.clone(), asset);
+        let feed_key = StakingStorageKey::FeedStake(node, asset);
+        let stake_val: Option<storage::FeedStakeValue> = env
+            .storage()
             .persistent()
-            .get(&StakingStorageKey::FeedStake(node, asset))
-            .unwrap_or(0)
+            .get(&feed_key);
+        stake_val.map(|v| v.amount).unwrap_or(0)
     }
 
     pub fn get_corridor_fee_pool(env: Env, asset: AssetId) -> CorridorFeePool {
@@ -1069,7 +1081,9 @@ impl TimeLockedUpgradeContract {
 
         check_bond_capacity(&env, &node, &pool)?;
 
-        Self::_record_heartbeat(&env, symbol_to_asset_id(&pool));
+        let asset_id = symbol_to_asset_id(&pool);
+        storage::update_feed_stake_activity(&env, node.clone(), asset_id);
+        Self::_record_heartbeat(&env, asset_id);
         Ok(())
     }
 }
