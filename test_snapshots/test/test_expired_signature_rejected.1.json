@@ -28,7 +28,7 @@
   ],
   "ledger": {
     "protocol_version": 20,
-    "sequence_number": 0,
+    "sequence_number": 200,
     "timestamp": 1000,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 10,
@@ -71,6 +71,14 @@
                               },
                               "val": {
                                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "max_fee_ceiling"
+                              },
+                              "val": {
+                                "u64": 1000000000
                               }
                             },
                             {
@@ -384,6 +392,9 @@
                 },
                 {
                   "u64": 500
+                },
+                {
+                  "u64": 1
                 }
               ]
             }
@@ -486,6 +497,9 @@
                     },
                     {
                       "u64": 500
+                    },
+                    {
+                      "u64": 1
                     }
                   ]
                 }

@@ -23,9 +23,24 @@ pub fn require_multisig(env: &Env, signers: &Vec<Address>) -> Result<(), Contrac
     for i in 0..signers.len() {
         let signer = signers.get(i).unwrap();
         let is_authorized = authorized_signers.contains_key(signer.clone()) || data.admin == signer;
+        #[cfg(test)]
+        {
+            extern crate std;
+            std::println!("Checking signer: {:?}, is_authorized: {}, admin: {:?}", signer, is_authorized, data.admin);
+        }
         
         if is_authorized && !verified.contains_key(signer.clone()) {
+            #[cfg(test)]
+            {
+                extern crate std;
+                std::println!("Calling require_auth on signer: {:?}", signer);
+            }
             signer.require_auth();
+            #[cfg(test)]
+            {
+                extern crate std;
+                std::println!("require_auth succeeded for signer: {:?}", signer);
+            }
             verified.set(signer.clone(), ());
             valid_count += 1;
         }

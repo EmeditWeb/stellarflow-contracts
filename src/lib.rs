@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, Map, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, Map, Symbol, Vec};
 
 /// Numeric asset identifier for gas-optimized storage.
 /// Replaces heavy Symbol identifiers in high-frequency paths.
@@ -8,14 +8,11 @@ pub type AssetId = u32;
 /// Convert a currency Symbol to a numeric AssetId using FNV-1a hash.
 /// This provides deterministic mapping while minimizing gas costs.
 pub fn symbol_to_asset_id(symbol: &Symbol) -> AssetId {
-    let bytes = symbol.to_val();
+    let payload = symbol.to_val().get_payload();
     // Simple FNV-1a hash for deterministic conversion
     let mut hash: u32 = 2166136261u32;
-    // In Soroban, we use a simple approach based on the symbol's internal representation
-    // For production, this could be replaced with a pre-defined mapping table
-    let symbol_str = symbol.to_string();
-    for byte in symbol_str.bytes() {
-        hash ^= byte as u32;
+    for byte in payload.to_le_bytes().iter() {
+        hash ^= *byte as u32;
         hash = hash.wrapping_mul(16777619);
     }
     hash
@@ -53,7 +50,10 @@ pub mod consensus;
 pub mod math;
 pub mod staking_tiers;
 pub mod governance;
+pub mod validation;
+pub mod admin;
 use crate::governance::{verify_staged_delay, StagedUpgrade};
+use crate::validation::check_bond_capacity;
 
 pub use staking_tiers::{AssetFeedMetrics, StakingTier, StakingTierConfig};
 use staking_tiers::{
@@ -96,6 +96,10 @@ pub enum ContractError {
     TransferAlreadyPending = 24,
     /// No pending owner nominee exists to claim ownership.
     NoPendingOwner = 25,
+    /// Validation epoch is officially closed or has not started yet.
+    EpochClosed = 26,
+    /// Fee ceiling exceeded.
+    FeeCeilingExceeded = 27,
 }
 
 // Contract state keys
@@ -130,7 +134,7 @@ pub struct RevocationProposal {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractData {
     pub admin: Address,
     pub value: u64,
@@ -155,7 +159,7 @@ pub struct NodeProfile {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CorridorFeePool {
     pub asset: AssetId,
     pub collected: u64,
@@ -163,7 +167,7 @@ pub struct CorridorFeePool {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CorridorFeeKey {
     Asset(AssetId),
 }
@@ -210,7 +214,7 @@ impl TimeLockedUpgradeContract {
         stakes.set(node.clone(), amount);
         env.storage().instance().set(&STAKE_REGISTRY_KEY, &stakes);
         env.storage().instance().set(&TOTAL_STAKED_KEY, &new_total);
-        Self::_record_heartbeat(&env, symbol_short!("STAKE"));
+        Self::_record_heartbeat(&env, symbol_to_asset_id(&symbol_short!("STAKE")));
         Ok(StakeRecord { node, amount, registered_at: env.ledger().timestamp() })
     }
 
@@ -228,7 +232,7 @@ impl TimeLockedUpgradeContract {
 
     pub fn remove_signer(env: Env, signer: Address, caller: Address) -> Result<(), ContractError> {
         Self::assert_contract_is_active(&env)?;
-        let data = Self::get_data(&env)?;
+        let data = Self::get_data(env.clone())?;
         if data.admin != caller { return Err(ContractError::NotAdmin); }
         caller.require_auth();
 
@@ -243,7 +247,7 @@ impl TimeLockedUpgradeContract {
     pub fn vote_revocation(env: Env, voter: Address, sig_expires_at: u64) -> Result<(), ContractError> {
         if env.ledger().timestamp() > sig_expires_at { return Err(ContractError::SignatureExpired); }
         voter.require_auth();
-        let data = Self::get_data(&env)?;
+        let data = Self::get_data(env.clone())?;
 
         if !Self::_is_signer(&env, &voter) && data.admin != voter {
             return Err(ContractError::Unauthorized);
@@ -273,24 +277,24 @@ impl TimeLockedUpgradeContract {
 
     // --- Core Logic Boilerplate ---
 
-    pub fn get_data(env: &Env) -> Result<ContractData, ContractError> {
+    pub fn get_data(env: Env) -> Result<ContractData, ContractError> {
         env.storage().instance().get(&DATA_KEY).ok_or(ContractError::NotInitialized)
     }
 
     pub fn propose_upgrade(env: Env, new_wasm_hash: BytesN<32>, proposer: Address, nonce: u64, salt: Bytes, salt_signature: BytesN<32>, sig_expires_at: u64) -> Result<(), ContractError> {
         if env.ledger().timestamp() > sig_expires_at { return Err(ContractError::SignatureExpired); }
-        let data = Self::get_data(&env)?;
+        let data = Self::get_data(env.clone())?;
         if data.admin != proposer { return Err(ContractError::NotAdmin); }
         proposer.require_auth();
         consume_nonce(&env, &proposer, nonce, salt, salt_signature);
-        let staged = StagedUpgrade { wasm_hash: new_wasm_hash.into(), staged_at: env.ledger().sequence() };
+        let staged = StagedUpgrade { wasm_hash: new_wasm_hash, staged_at: env.ledger().sequence() };
         env.storage().instance().set(&PENDING_UPGRADE_KEY, &staged);
         Ok(())
     }
 
     pub fn execute_upgrade(env: Env, executor: Address, nonce: u64, salt: Bytes, signature: BytesN<32>, sig_expires_at: u64) -> Result<(), ContractError> {
         if env.ledger().timestamp() > sig_expires_at { return Err(ContractError::SignatureExpired); }
-        let data = Self::get_data(&env)?;
+        let data = Self::get_data(env.clone())?;
         if data.admin != executor { return Err(ContractError::NotAdmin); }
         executor.require_auth();
         consume_nonce(&env, &executor, nonce, salt, signature)?;
@@ -298,7 +302,7 @@ impl TimeLockedUpgradeContract {
         if !verify_staged_delay(pending.staged_at, env.ledger().sequence()) {
             return Err(ContractError::UpgradeTimelockNotSatisfied);
         }
-        env.deployer().update_current_contract_wasm(BytesN::from_array(&env, &pending.wasm_hash));
+        env.deployer().update_current_contract_wasm(pending.wasm_hash);
         env.storage().instance().remove(&PENDING_UPGRADE_KEY);
         Ok(())
     }
@@ -314,7 +318,7 @@ impl TimeLockedUpgradeContract {
     }
 
     pub fn cancel_upgrade(env: Env, canceller: Address) -> Result<(), ContractError> {
-        let data = Self::get_data(&env)?;
+        let data = Self::get_data(env.clone())?;
         if data.admin != canceller { return Err(ContractError::NotAdmin); }
         canceller.require_auth();
         env.storage().instance().remove(&PENDING_UPGRADE_KEY);
@@ -323,16 +327,17 @@ impl TimeLockedUpgradeContract {
 
     pub fn set_value(env: Env, new_value: u64, caller: Address, nonce: u64, salt: Bytes, signature: BytesN<32>, sig_expires_at: u64, sequence: u64) -> Result<(), ContractError> {
         if env.ledger().timestamp() > sig_expires_at { return Err(ContractError::SignatureExpired); }
-        let mut data = Self::get_data(&env)?;
+        let mut data = Self::get_data(env.clone())?;
         if data.admin != caller { return Err(ContractError::NotAdmin); }
         if new_value > data.max_fee_ceiling { return Err(ContractError::FeeCeilingExceeded); }
         caller.require_auth();
         consume_nonce(&env, &caller, nonce, salt, signature)?;
-        seq_map.set(caller, sequence);
+        let mut seq_map: Map<Address, u64> = env.storage().instance().get(&SEQUENCE_COUNTER_KEY).unwrap_or_else(|| Map::new(&env));
+        seq_map.set(caller.clone(), sequence);
         env.storage().instance().set(&SEQUENCE_COUNTER_KEY, &seq_map);
         data.value = new_value;
         env.storage().instance().set(&DATA_KEY, &data);
-        Self::_record_heartbeat(&env, symbol_short!("VALUE"));
+        Self::_record_heartbeat(&env, symbol_to_asset_id(&symbol_short!("VALUE")));
         Ok(())
     }
 
@@ -351,7 +356,7 @@ impl TimeLockedUpgradeContract {
 
     pub fn set_heartbeat_interval(env: Env, interval: u64, admin: Address) -> Result<(), ContractError> {
         if interval == 0 { return Err(ContractError::InvalidHeartbeatInterval); }
-        let data = Self::get_data(&env)?;
+        let data = Self::get_data(env.clone())?;
         if data.admin != admin { return Err(ContractError::NotAdmin); }
         admin.require_auth();
         env.storage().instance().set(&HB_INTERVAL_KEY, &interval);
@@ -375,27 +380,27 @@ impl TimeLockedUpgradeContract {
     ) -> Result<(), ContractError> {
         node.require_auth();
         check_bond_capacity(&env, &node, &pool)?;
-        Self::_record_heartbeat(&env, pool);
+        Self::_record_heartbeat(&env, symbol_to_asset_id(&pool));
         Ok(())
     }
 
     pub fn update_heartbeat(env: Env, asset: Symbol, updater: Address) -> Result<(), ContractError> {
-        let data = Self::get_data(&env)?;
+        let data = Self::get_data(env.clone())?;
         if data.admin != updater { return Err(ContractError::NotAdmin); }
         updater.require_auth();
-        Self::_record_heartbeat(&env, asset);
+        Self::_record_heartbeat(&env, symbol_to_asset_id(&asset));
         Ok(())
     }
 
-    pub fn is_data_fresh(env: &Env, asset: AssetId) -> bool {
-        let timestamps: Map<AssetId, u64> = env.storage().temporary().get(&HEARTBEAT_KEY).unwrap_or_else(|| Map::new(env));
+    pub fn is_data_fresh(env: Env, asset: AssetId) -> bool {
+        let timestamps: Map<AssetId, u64> = env.storage().temporary().get(&HEARTBEAT_KEY).unwrap_or_else(|| Map::new(&env));
         if let Some(last_update) = timestamps.get(asset) {
-            env.ledger().timestamp().saturating_sub(last_update) <= Self::_get_interval(env)
+            env.ledger().timestamp().saturating_sub(last_update) <= Self::_get_interval(&env)
         } else { false }
     }
 
     pub fn upsert_node_profile(env: Env, admin: Address, node: Address, rate: u64, confidence: u32) -> Result<(), ContractError> {
-        let data = Self::get_data(&env)?;
+        let data = Self::get_data(env.clone())?;
         if data.admin != admin { return Err(ContractError::NotAdmin); }
         admin.require_auth();
         let mut profiles = Self::_get_node_profiles(&env);
@@ -429,7 +434,7 @@ impl TimeLockedUpgradeContract {
         config: StakingTierConfig,
         signers: Vec<Address>,
     ) -> Result<(), ContractError> {
-        let data = Self::get_data(&env)?;
+        let data = Self::get_data(env.clone())?;
         if data.admin != admin {
             return Err(ContractError::NotAdmin);
         }
@@ -462,7 +467,7 @@ impl TimeLockedUpgradeContract {
         volatility_bps: u32,
         signers: Vec<Address>,
     ) -> Result<AssetFeedMetrics, ContractError> {
-        let data = Self::get_data(&env)?;
+        let data = Self::get_data(env.clone())?;
         if data.admin != admin {
             return Err(ContractError::NotAdmin);
         }
@@ -561,8 +566,7 @@ impl TimeLockedUpgradeContract {
 
         let feed_key = StakingStorageKey::FeedStake(node.clone(), asset.clone());
         let amount: u64 = env
-            .storage()
-            .persistent()
+            .storage().persistent()
             .get(&feed_key)
             .ok_or(ContractError::NotRegistered)?;
 
@@ -618,7 +622,7 @@ impl TimeLockedUpgradeContract {
     }
 
     pub fn register_signer(env: Env, signer: Address, caller: Address) -> Result<(), ContractError> {
-        let data = Self::get_data(&env)?;
+        let data = Self::get_data(env.clone())?;
         if data.admin != caller { return Err(ContractError::NotAdmin); }
         caller.require_auth();
         let mut signers = Self::_get_signers(&env);
@@ -694,12 +698,12 @@ impl TimeLockedUpgradeContract {
         n / 2 + 1
     }
 
-    fn _resolve_feed_metrics(env: &Env, asset: &Symbol) -> AssetFeedMetrics {
-        let pool = Self::get_corridor_fee_pool(env.clone(), asset.clone());
+    fn _resolve_feed_metrics(env: &Env, asset: &AssetId) -> AssetFeedMetrics {
+        let pool = Self::get_corridor_fee_pool(env.clone(), *asset);
         let stored: AssetFeedMetrics = env
             .storage()
             .persistent()
-            .get(&StakingStorageKey::AssetMetrics(asset.clone()))
+            .get(&StakingStorageKey::AssetMetrics(*asset))
             .unwrap_or(AssetFeedMetrics {
                 volume_score: 0,
                 volatility_bps: 0,
@@ -791,24 +795,26 @@ mod query_guardrail_tests {
         let admin = Address::generate(&env);
         client.initialize(&admin);
 
-        let asset: AssetId = 2654435761; // KES
-        client.update_heartbeat(&asset, &admin);
-
+        let asset_sym = symbol_short!("KES");
+        let asset = symbol_to_asset_id(&asset_sym);
+        client.update_heartbeat(&asset_sym, &admin);
+ 
         assert!(client.is_data_fresh(&asset));
-
+ 
         advance(&env, DEFAULT_HEARTBEAT_INTERVAL + 1);
         assert!(!client.is_data_fresh(&asset));
     }
-
+ 
     // Calling is_data_fresh multiple times never alters the heartbeat storage slot.
     #[test]
     fn test_is_data_fresh_does_not_mutate_heartbeat() {
         let (env, client) = setup();
         let admin = Address::generate(&env);
         client.initialize(&admin);
-
-        let asset: AssetId = 4026531840; // GHS
-        client.update_heartbeat(&asset, &admin);
+ 
+        let asset_sym = symbol_short!("GHS");
+        let asset = symbol_to_asset_id(&asset_sym);
+        client.update_heartbeat(&asset_sym, &admin);
 
         for _ in 0..5 {
             assert!(client.is_data_fresh(&asset));

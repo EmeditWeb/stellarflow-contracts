@@ -45,7 +45,6 @@
         }
       ]
     ],
-    [],
     []
   ],
   "ledger": {
@@ -83,7 +82,7 @@
                   "map": [
                     {
                       "key": {
-                        "symbol": "NGN"
+                        "u32": 303994223
                       },
                       "val": {
                         "u64": 0
@@ -95,7 +94,7 @@
             },
             "ext": "v0"
           },
-          15
+          17280
         ]
       ],
       [
@@ -133,6 +132,14 @@
                               },
                               "val": {
                                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "max_fee_ceiling"
+                              },
+                              "val": {
+                                "u64": 1000000000
                               }
                             },
                             {
@@ -366,7 +373,7 @@
               }
             ],
             "data": {
-              "symbol": "NGN"
+              "u32": 3897123275
             }
           }
         }
@@ -389,56 +396,7 @@
               }
             ],
             "data": {
-              "bool": true
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
-              },
-              {
-                "symbol": "get_last_update_timestamp"
-              }
-            ],
-            "data": {
-              "symbol": "NGN"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "get_last_update_timestamp"
-              }
-            ],
-            "data": {
-              "u64": 0
+              "bool": false
             }
           }
         }
