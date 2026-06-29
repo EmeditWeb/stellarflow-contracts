@@ -36,21 +36,13 @@ pub fn symbol_to_asset_id(symbol: &Symbol) -> AssetId {
 /// Convert an AssetId back to a Symbol for backward compatibility.
 /// Note: This is lossy - use pre-defined mappings for production.
 pub fn asset_id_to_symbol(_env: &Env, id: AssetId) -> Symbol {
-    // For common currencies, use a mapping table
     match id {
-        // Nigerian Naira
         3897123275 => symbol_short!("NGN"),
-        // Kenyan Shilling
         2654435761 => symbol_short!("KES"),
-        // Ghanaian Cedi
         4026531840 => symbol_short!("GHS"),
-        // West African CFA Franc
         4160749568 => symbol_short!("CFA"),
-        // South African Rand
         3219226362 => symbol_short!("ZAR"),
-        // Ugandan Shilling
         2863311530 => symbol_short!("UGX"),
-        // Special asset identifiers
         0 => symbol_short!("STAKE"),
         1 => symbol_short!("VALUE"),
         _ => symbol_short!("UNK"),
@@ -65,6 +57,7 @@ pub mod auth;
 pub mod config;
 pub use config::{PriceVarianceConfig, get_price_variance_config, set_price_variance_config};
 pub mod consensus;
+pub mod fees;
 pub mod governance;
 pub mod math;
 pub mod staking_tiers;
@@ -125,9 +118,11 @@ pub enum ContractError {
     /// The proposed fee exceeds the maximum allowed ceiling.
     FeeCeilingExceeded = 27,
     /// Incoming tracking sequence is less than or equal to the active stored checkpoint value.
-    StaleSequence = 26,
+    StaleSequence = 33,
     /// A price-variance configuration field violated one or more struct invariants.
     InvalidVarianceConfig = 28,
+    /// Stale telemetry data payload rejected during validation step.
+    StaleTelemetryPayload = 34,
 }
 
 // Contract state keys
@@ -185,20 +180,6 @@ pub struct NodeProfile {
     pub rate: u64,
     pub confidence: u32,
     pub updated_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct CorridorFeePool {
-    pub asset: AssetId,
-    pub collected: u64,
-    pub variable_pool: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub enum CorridorFeeKey {
-    Asset(AssetId),
 }
 
 #[contracttype]
@@ -601,30 +582,35 @@ impl TimeLockedUpgradeContract {
 
     pub fn add_corridor_fees(
         env: Env,
+        admin: Address,
         asset: AssetId,
         collected: u64,
         variable_fee: u64,
-    ) -> Result<CorridorFeePool, ContractError> {
-        let key = CorridorFeeKey::Asset(asset);
-        let mut pool: CorridorFeePool =
-            env.storage()
-                .persistent()
-                .get(&key)
-                .unwrap_or(CorridorFeePool {
-                    asset,
-                    collected: 0,
-                    variable_pool: 0,
-                });
-        pool.collected = pool
-            .collected
-            .checked_add(collected)
-            .ok_or(ContractError::Overflow)?;
-        pool.variable_pool = pool
-            .variable_pool
-            .checked_add(variable_fee)
-            .ok_or(ContractError::Overflow)?;
-        env.storage().persistent().set(&key, &pool);
+    ) -> Result<fees::CorridorFeePool, ContractError> {
+        let pool = fees::add_corridor_fees(env.clone(), admin, asset, collected, variable_fee)?;
+        Self::_extend_instance_ttl(&env);
         Ok(pool)
+    }
+
+    pub fn get_corridor_fee_pool(env: Env, asset: AssetId) -> fees::CorridorFeePool {
+        fees::get_corridor_fee_pool(env, asset)
+    }
+
+    pub fn set_corridor_weight(
+        env: Env,
+        admin: Address,
+        asset: AssetId,
+        base_weight: u64,
+        dynamic_weight: u64,
+    ) -> Result<fees::CorridorWeightProfile, ContractError> {
+        let profile =
+            fees::set_corridor_weight(env.clone(), admin, asset, base_weight, dynamic_weight)?;
+        Self::_extend_instance_ttl(&env);
+        Ok(profile)
+    }
+
+    pub fn get_corridor_weight(env: Env, asset: AssetId) -> fees::CorridorWeightProfile {
+        fees::get_corridor_weight(env, asset)
     }
 
     // ── Dynamic Staking Tier Assignment (Issue #300) ─────────────────────────
@@ -694,8 +680,6 @@ impl TimeLockedUpgradeContract {
     pub fn get_staking_tier(env: Env, asset: AssetId) -> StakingTier {
         assign_tier(&Self::_resolve_feed_metrics(&env, &asset))
     }
-
-
 
     /// Return the minimum stake a validator must post for a currency feed.
     pub fn get_required_stake(env: Env, asset: AssetId) -> u64 {
@@ -809,17 +793,6 @@ impl TimeLockedUpgradeContract {
             .unwrap_or(0)
     }
 
-    pub fn get_corridor_fee_pool(env: Env, asset: AssetId) -> CorridorFeePool {
-        env.storage()
-            .persistent()
-            .get(&CorridorFeeKey::Asset(asset))
-            .unwrap_or(CorridorFeePool {
-                asset,
-                collected: 0,
-                variable_pool: 0,
-            })
-    }
-
     pub fn set_platform_capital(env: Env, capital: u64) {
         env.storage()
             .instance()
@@ -889,10 +862,6 @@ impl TimeLockedUpgradeContract {
     // ── Price-Variance Configuration (Issue #420) ─────────────────────────
 
     /// Replace the complete price-variance configuration in one atomic write.
-    ///
-    /// Accepts the **full** [`PriceVarianceConfig`] struct; individual field
-    /// mutations are intentionally not exposed so that all ledger storage slots
-    /// remain uniformly aligned after every update.
     pub fn set_price_variance_config(
         env: Env,
         caller: Address,
@@ -904,8 +873,6 @@ impl TimeLockedUpgradeContract {
     }
 
     /// Return the active price-variance configuration.
-    ///
-    /// Falls back to compile-time defaults when no config has been written yet.
     pub fn get_price_variance_config(env: Env) -> PriceVarianceConfig {
         config::get_price_variance_config(&env)
     }
@@ -917,48 +884,31 @@ impl TimeLockedUpgradeContract {
 
     // ── Emergency Key Revocation (multi-sig coordinator group) ───────────────
 
-    /// Phase 1: any registered signer or the current admin opens an emergency
-    /// revocation proposal against a compromised hot-wallet address.
-    ///
-    /// The caller must not be the target.  Only one proposal may be active
-    /// at a time.
     pub fn propose_emergency_revocation(
         env: Env,
         proposer: Address,
         target: Address,
         replacement: Address,
     ) -> Result<(), ContractError> {
-        // Guard: a revoked coordinator must not be able to open proposals.
         admin::assert_not_revoked(&env, &proposer)?;
         admin::propose_emergency_revocation(&env, proposer, target, replacement)
     }
 
-    /// Phase 2: any registered signer or the current admin casts a vote on
-    /// the active emergency revocation proposal.
-    ///
-    /// Once majority threshold is reached the target address is **immediately**
-    /// blocked in storage (`REVOKED_SIGNER_KEY`) and removed from the signer
-    /// set, preventing it from signing or modifying configurations from that
-    /// point forward.
     pub fn vote_emergency_revocation(
         env: Env,
         voter: Address,
         sig_expires_at: u64,
     ) -> Result<(), ContractError> {
-        // Guard: a revoked coordinator must not be allowed to vote.
         admin::assert_not_revoked(&env, &voter)?;
         admin::vote_emergency_revocation(&env, voter, sig_expires_at)
     }
 
-    /// Returns the active emergency revocation proposal, if one exists.
     pub fn get_emergency_revocation(
         env: Env,
     ) -> Option<admin::EmergencyRevocationProposal> {
         admin::get_emergency_revocation_proposal(&env)
     }
 
-    /// Returns `true` if `addr` has been stamped as revoked by the
-    /// multi-sig coordinator group.
     pub fn is_revoked(env: Env, addr: Address) -> bool {
         admin::is_revoked(&env, &addr)
     }
@@ -1051,7 +1001,7 @@ impl TimeLockedUpgradeContract {
                 volume_score: 10,
                 volatility_bps: 100,
             });
-        let corridor = Self::get_corridor_fee_pool(env.clone(), *asset);
+        let corridor = fees::get_corridor_fee_pool(env.clone(), *asset);
         AssetFeedMetrics {
             volume_score: effective_volume_score(stored.volume_score, corridor.collected),
             volatility_bps: stored.volatility_bps,
