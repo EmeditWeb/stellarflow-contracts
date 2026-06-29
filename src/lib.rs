@@ -980,7 +980,7 @@ impl TimeLockedUpgradeContract {
     ///
     /// This can be called by any party since the primary security model relies on
     /// the voting threshold for proposal execution, not on proposal creation.
-    pub fn purge_expired_revocation_proposal(env: Env) -> Result<(), ContractError> {
+    pub fn purge_expired_revocation_prop(env: Env) -> Result<(), ContractError> {
         admin::purge_emergency_revocation_proposal(&env)
     }
 

@@ -52,24 +52,53 @@ pub fn require_multisig(env: &Env, signers: &Vec<Address>) -> Result<(), Contrac
         .ok_or(ContractError::NotInitialized)?;
 
     let mut valid_count = 0u32;
-    let signers_slice = signers.iter();
+    let mut seen_indices = [0u32; 16];
+    let mut seen_count = 0usize;
 
-    // Use slice-based iteration to avoid heap allocations
-    for (idx, signer) in signers_slice.clone().enumerate() {
-        // Avoid repeated signature validation for duplicate signers using slice comparison
-        let is_duplicate = signers_slice.clone().take(idx).any(|previous| previous == signer);
+    // Use flat stack array scanning to evaluate signers in a single pass without heap allocations
+    for signer in signers.iter() {
+        let mut auth_idx = None;
+        if signer == data.admin {
+            auth_idx = Some(0u32);
+        } else {
+            for (i, key) in authorized_signers.keys().iter().enumerate() {
+                if key == signer {
+                    auth_idx = Some((i + 1) as u32);
+                    break;
+                }
+            }
+        }
+
+        let auth_idx = match auth_idx {
+            Some(idx) => idx,
+            None => continue,
+        };
+
+        // Avoid repeated signature validation for duplicate signers using flat stack array scanning
+        let mut is_duplicate = false;
+        for i in 0..seen_count {
+            if seen_indices[i] == auth_idx {
+                is_duplicate = true;
+                break;
+            }
+        }
         if is_duplicate {
             continue;
         }
 
         let state = get_validator_state(env, &signer);
-        let is_authorized = (authorized_signers.contains_key(signer.clone()) || data.admin == signer.clone())
-            && (state & ACTIVE) != 0;
+        let is_authorized = (state & ACTIVE) != 0;
         if !is_authorized {
             continue;
         }
 
         signer.require_auth();
+        
+        if seen_count < 16 {
+            seen_indices[seen_count] = auth_idx;
+            seen_count += 1;
+        }
+
         valid_count += 1;
         set_validator_flag(env, &signer, ONLINE, true);
 
