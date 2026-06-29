@@ -1,7 +1,6 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env, Map, Symbol};
 use crate::ContractError;
 
-// Ballot TTL: ~24 hours at 5 s/ledger, matching the consensus validation window.
 const BALLOT_TTL_LEDGERS: u32 = 17_280;
 const BALLOT_TTL_THRESHOLD: u32 = 5_000;
 
@@ -9,28 +8,20 @@ const BALLOT_TTL_THRESHOLD: u32 = 5_000;
 #[contracttype]
 #[derive(Clone)]
 pub struct StagedUpgrade {
-    pub wasm_hash: BytesN<32>,
-    pub staged_at: u32,
+    pub new_wasm_hash: BytesN<32>,
+    pub proposer: Address,
+    pub staged_at: u64,
 }
 
-/// Return true once the required ledger delay (5 000 ledgers ≈ 7 h at 5 s/ledger) has elapsed.
-pub fn verify_staged_delay(staged_at: u32, current_sequence: u32) -> bool {
-    const MIN_LEDGER_DELAY: u32 = 5_000;
-    current_sequence.saturating_sub(staged_at) >= MIN_LEDGER_DELAY
+pub fn verify_staged_delay(staged_at: u64, current_time: u64, delay_seconds: u64) -> bool {
+    current_time.saturating_sub(staged_at) >= delay_seconds
 }
 
-/// Storage key for an ephemeral voting ballot, scoped by proposal identifier.
 #[contracttype]
 pub enum BallotKey {
     Proposal(Symbol),
 }
 
-/// Ephemeral multi-sig voting ballot stored in Temporary storage.
-///
-/// The ledger garbage-collects this entry automatically once the TTL expires,
-/// keeping the ledger state lean after inconclusive or expired consensus rounds.
-/// Explicit `close_ballot` calls provide the primary cleanup path once a round
-/// concludes so the ledger is reclaimed immediately rather than waiting for TTL.
 #[contracttype]
 #[derive(Clone)]
 pub struct VotingBallot {
@@ -41,9 +32,6 @@ pub struct VotingBallot {
     pub votes: Map<Address, ()>,
 }
 
-/// Write a new ballot to Temporary storage keyed by `proposal_id`.
-///
-/// Returns `ProposalAlreadyActive` when a ballot for the same id already exists.
 pub fn open_ballot(
     env: &Env,
     proposal_id: Symbol,
@@ -63,15 +51,10 @@ pub fn open_ballot(
         votes: Map::new(env),
     };
     env.storage().temporary().set(&key, &ballot);
-    env.storage()
-        .temporary()
-        .extend_ttl(&key, BALLOT_TTL_THRESHOLD, BALLOT_TTL_LEDGERS);
+    env.storage().temporary().extend_ttl(&key, BALLOT_TTL_THRESHOLD, BALLOT_TTL_LEDGERS);
     Ok(())
 }
 
-/// Record a vote on an active ballot, refreshing its TTL on each write.
-///
-/// Returns the updated ballot so callers can inspect the current vote tally.
 pub fn cast_vote(
     env: &Env,
     proposal_id: Symbol,
@@ -83,31 +66,41 @@ pub fn cast_vote(
         .temporary()
         .get(&key)
         .ok_or(ContractError::NoActiveProposal)?;
-
     if ballot.votes.contains_key(voter.clone()) {
         return Err(ContractError::AlreadyVoted);
     }
     ballot.votes.set(voter, ());
     env.storage().temporary().set(&key, &ballot);
-    env.storage()
-        .temporary()
-        .extend_ttl(&key, BALLOT_TTL_THRESHOLD, BALLOT_TTL_LEDGERS);
+    env.storage().temporary().extend_ttl(&key, BALLOT_TTL_THRESHOLD, BALLOT_TTL_LEDGERS);
     Ok(ballot)
 }
 
-/// Read an active ballot from Temporary storage without mutating it.
 pub fn get_ballot(env: &Env, proposal_id: Symbol) -> Option<VotingBallot> {
-    env.storage()
-        .temporary()
-        .get(&BallotKey::Proposal(proposal_id))
+    env.storage().temporary().get(&BallotKey::Proposal(proposal_id))
 }
 
-/// Programmatically delete a ballot once the consensus epoch concludes.
-///
-/// This is the primary cleanup path; the Temporary TTL acts as a safety net
-/// for rounds that expire without reaching threshold or an explicit close call.
 pub fn close_ballot(env: &Env, proposal_id: Symbol) {
-    env.storage()
-        .temporary()
-        .remove(&BallotKey::Proposal(proposal_id));
+    env.storage().temporary().remove(&BallotKey::Proposal(proposal_id));
 }
+
+/// Verify that any incoming parameter modification maps to a target execution block height
+/// strictly greater than the current active configuration index.
+pub fn verify_block_height(target_height: u32, active_index: u32) -> bool {
+    target_height > active_index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_block_height() {
+        // Strictly greater target height should be valid
+        assert!(verify_block_height(101, 100));
+        // Equal target height should be invalid
+        assert!(!verify_block_height(100, 100));
+        // Less than target height should be invalid
+        assert!(!verify_block_height(99, 100));
+    }
+}
+
