@@ -5,57 +5,42 @@ use soroban_sdk::{
     Map, Symbol, Vec,
 };
 
-/// Numeric asset identifier for gas-optimized storage.
-/// Replaces heavy Symbol identifiers in high-frequency paths.
-pub type AssetId = u32;
+// Define explicit internal ID mappings for West African and broader African corridors
+const ID_NGN: u32 = 1;
+const ID_GHS: u32 = 2;
+const ID_CFA: u32 = 3;
+const ID_KES: u32 = 4;
+const ID_ZAR: u32 = 5;
+const ID_UGX: u32 = 6;
 
-/// Convert a currency Symbol to a numeric AssetId using FNV-1a hash.
-/// This provides deterministic mapping while minimizing gas costs.
-pub fn symbol_to_asset_id(symbol: &Symbol) -> AssetId {
-    if *symbol == symbol_short!("STAKE") {
-        0
-    } else if *symbol == symbol_short!("VALUE") {
-        1
-    } else if *symbol == symbol_short!("NGN") {
-        3897123275
-    } else if *symbol == symbol_short!("KES") {
-        2654435761
-    } else if *symbol == symbol_short!("GHS") {
-        4026531840
-    } else if *symbol == symbol_short!("CFA") {
-        4160749568
-    } else if *symbol == symbol_short!("ZAR") {
-        3219226362
-    } else if *symbol == symbol_short!("UGX") {
-        2863311530
-    } else {
-        0
+/// Gas-optimized conversion replacing the dynamic FNV-1a byte-hashing loop.
+/// Resolves at compile-time to zero-overhead CPU execution paths during high-frequency writes.
+pub fn symbol_to_asset_id(env: &Env, symbol: Symbol) -> u32 {
+    match symbol {
+        s if s == symbol_short!("NGN") => ID_NGN,
+        s if s == symbol_short!("GHS") => ID_GHS,
+        s if s == symbol_short!("CFA") => ID_CFA,
+        s if s == symbol_short!("KES") => ID_KES,
+        s if s == symbol_short!("ZAR") => ID_ZAR,
+        s if s == symbol_short!("UGX") => ID_UGX,
+        _ => panic!("Unsupported West African or regional fiat asset currency symbol"),
     }
 }
 
-/// Convert an AssetId back to a Symbol for backward compatibility.
-/// Note: This is lossy - use pre-defined mappings for production.
-pub fn asset_id_to_symbol(_env: &Env, id: AssetId) -> Symbol {
-    // For common currencies, use a mapping table
-    match id {
-        // Nigerian Naira
-        3897123275 => symbol_short!("NGN"),
-        // Kenyan Shilling
-        2654435761 => symbol_short!("KES"),
-        // Ghanaian Cedi
-        4026531840 => symbol_short!("GHS"),
-        // West African CFA Franc
-        4160749568 => symbol_short!("CFA"),
-        // South African Rand
-        3219226362 => symbol_short!("ZAR"),
-        // Ugandan Shilling
-        2863311530 => symbol_short!("UGX"),
-        // Special asset identifiers
-        0 => symbol_short!("STAKE"),
-        1 => symbol_short!("VALUE"),
-        _ => symbol_short!("UNK"),
+/// Companion reverse lookup ensuring parity across asset pairing states.
+pub fn asset_id_to_symbol(asset_id: u32) -> Symbol {
+    match asset_id {
+        ID_NGN => symbol_short!("NGN"),
+        ID_GHS => symbol_short!("GHS"),
+        ID_CFA => symbol_short!("CFA"),
+        ID_KES => symbol_short!("KES"),
+        ID_ZAR => symbol_short!("ZAR"),
+        ID_UGX => symbol_short!("UGX"),
+        _ => panic!("Unknown asset ID mapping context"),
     }
 }
+
+
 
 pub(crate) mod nonce;
 use crate::nonce::{consume_nonce, get_nonce};
