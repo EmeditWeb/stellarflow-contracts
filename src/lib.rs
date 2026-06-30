@@ -54,6 +54,7 @@ use crate::governance::{verify_staged_delay, StagedUpgrade};
 use crate::validation::{check_bond_capacity, validate_telemetry_submission};
 use crate::governance::{
     verify_staged_delay, StagedUpgrade, VotingBallot, open_ballot, cast_vote, close_ballot,
+
 };
 use crate::validation::check_bond_capacity;
 
@@ -125,7 +126,20 @@ pub enum ContractError {
     InsufficientVolume = 35,
     StaleSequence = 28,
     /// A price-variance configuration field violated one or more struct invariants.
+
+    InvalidVarianceConfig = 28,
+
+    /// Incoming telemetry payload is older than the configured freshness window.
+    StaleTelemetryPayload = 35,
+    /// Pool liquidity / volume depth is below the minimum economic security gate.
+    InsufficientLiquidityDepth = 36,
+
+    /// Incoming telemetry payload's ledger timestamp is too far behind.
+    StaleTelemetryPayload = 34,
+
+
     InvalidVarianceConfig = 33,
+
 }
 
 // Contract state keys
@@ -516,6 +530,7 @@ impl TimeLockedUpgradeContract {
         let data = Self::_load_data(&env)?;
         if data.admin != updater { return Err(ContractError::NotAdmin); }
         updater.require_auth();
+        check_liquidity_depth(&env, asset)?;
         Self::_record_heartbeat(&env, asset);
         Self::_extend_instance_ttl(&env);
         Ok(())
@@ -1118,6 +1133,8 @@ impl TimeLockedUpgradeContract {
         node.require_auth();
 
         check_bond_capacity(&env, &node, &pool)?;
+        let asset = symbol_to_asset_id(&pool);
+        check_liquidity_depth(&env, asset)?;
 
         let asset_id = symbol_to_asset_id(&pool);
         storage::update_feed_stake_activity(&env, node.clone(), asset_id);
@@ -1282,6 +1299,7 @@ mod query_guardrail_tests {
         client.initialize(&admin, &treasury);
 
         let asset = symbol_to_asset_id(&symbol_short!("KES"));
+        client.add_corridor_fees(&asset, &crate::validation::MIN_POOL_VOLUME_DEPTH, &0u64);
         client.update_heartbeat(&asset, &admin);
 
         assert!(client.is_data_fresh(&asset));
@@ -1298,6 +1316,7 @@ mod query_guardrail_tests {
         client.initialize(&admin, &treasury);
 
         let asset = symbol_to_asset_id(&symbol_short!("GHS"));
+        client.add_corridor_fees(&asset, &crate::validation::MIN_POOL_VOLUME_DEPTH, &0u64);
         client.update_heartbeat(&asset, &admin);
 
         for _ in 0..5 {

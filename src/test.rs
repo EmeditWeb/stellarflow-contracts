@@ -189,6 +189,8 @@ fn test_heartbeat_fresh_data() {
 
     let asset = symbol_short!("NGN");
 
+    client.add_corridor_fees(&asset, &crate::validation::MIN_POOL_VOLUME_DEPTH, &0u64);
+
     // Update heartbeat
     client.update_heartbeat(&asset, &admin);
 
@@ -813,6 +815,8 @@ fn test_update_validator_profile_succeeds_with_sufficient_stake() {
     client.stake_and_register(&node, &crate::validation::PREMIUM_POOL_MIN_STAKE);
 
     let pool = symbol_short!("USDC");
+    let asset = crate::symbol_to_asset_id(&pool);
+    client.add_corridor_fees(&asset, &crate::validation::MIN_POOL_VOLUME_DEPTH, &0u64);
     // Must not error when stake >= PREMIUM_POOL_MIN_STAKE.
     client.update_validator_profile(&node, &pool);
 }
@@ -868,14 +872,123 @@ fn test_update_validator_profile_succeeds_above_min_stake() {
     client.stake_and_register(&node, &5_000u64);
 
     let pool = symbol_short!("XLM");
+    let asset = crate::symbol_to_asset_id(&pool);
+    client.add_corridor_fees(&asset, &crate::validation::MIN_POOL_VOLUME_DEPTH, &0u64);
     client.update_validator_profile(&node, &pool);
     let pool_id = crate::symbol_to_asset_id(&pool);
     assert!(client.is_data_fresh(&pool_id));
 }
 
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Liquidity depth gate tests - flash-loan manipulation protection
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_telemetry_update_rejects_thin_pool_depth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let treasury = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &treasury);
+
+    let asset: AssetId = 3897123275; // NGN
+    client.add_corridor_fees(
+        &asset,
+        &(crate::validation::MIN_POOL_VOLUME_DEPTH - 1),
+        &0u64,
+    );
+
+    let result = client.try_update_heartbeat(&asset, &admin);
+    assert_eq!(result, Err(Ok(ContractError::InsufficientLiquidityDepth)));
+    assert!(client.get_last_update_timestamp(&asset).is_none());
+}
+
+#[test]
+fn test_telemetry_update_accepts_sufficient_pool_depth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let treasury = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &treasury);
+
+    let asset: AssetId = 2654435761; // KES
+    client.add_corridor_fees(
+        &asset,
+        &crate::validation::MIN_POOL_VOLUME_DEPTH,
+        &0u64,
+    );
+
+    client.update_heartbeat(&asset, &admin);
+    assert!(client.is_data_fresh(&asset));
+}
+
+#[test]
+fn test_validator_profile_rejects_thin_pool_even_with_sufficient_bond() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let node = soroban_sdk::Address::generate(&env);
+    let treasury = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &treasury);
+
+    client.stake_and_register(&node, &crate::validation::PREMIUM_POOL_MIN_STAKE);
+    let pool = symbol_short!("USDC");
+    let asset = crate::symbol_to_asset_id(&pool);
+    client.add_corridor_fees(
+        &asset,
+        &(crate::validation::MIN_POOL_VOLUME_DEPTH - 1),
+        &0u64,
+    );
+
+    let before = client.get_last_update_timestamp(&asset);
+    let result = client.try_update_validator_profile(&node, &pool);
+    assert_eq!(result, Err(Ok(ContractError::InsufficientLiquidityDepth)));
+    assert_eq!(client.get_last_update_timestamp(&asset), before);
+}
+
+#[test]
+fn test_configured_volume_metrics_can_satisfy_liquidity_gate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let treasury = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &treasury);
+
+    let asset: AssetId = 4026531840; // GHS
+    client.set_asset_feed_metrics(
+        &admin,
+        &asset,
+        &crate::validation::MIN_POOL_VOLUME_SCORE,
+        &200,
+        &soroban_sdk::vec![&env, admin.clone()],
+    );
+
+    client.update_heartbeat(&asset, &admin);
+    assert!(client.is_data_fresh(&asset));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Emergency Key Revocation tests (multi-sig coordinator group)
+// ═════════════════════════════════════════════════════════════════════════════
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Ephemeral Ballot Lifecycle tests (Issue #484)
 // ═══════════════════════════════════════════════════════════════════════════
+
 
 #[test]
 fn test_propose_creates_ballot_in_temp_storage() {
