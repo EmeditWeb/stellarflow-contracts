@@ -1,8 +1,18 @@
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
+use crate::ContractError;
+use crate::storage::SequenceKey;
 use crate::ContractError;
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, Symbol, Vec};
 
 /// Basis-point denominator used when converting a BPS fraction to a multiplier.
 pub const BPS_DENOMINATOR: u64 = 10_000;
+
+/// Minimum safety threshold for block height gaps between consecutive submissions.
+/// Prevents ledger bloat from rapid telemetry updates within the same block window.
+pub const MIN_BLOCK_GAP_THRESHOLD: u32 = 3;
+
+/// Storage key for tracking the last successful ledger index per node.
+pub(crate) const BLOCK_TRACKER_KEY: Symbol = symbol_short!("BLKTRK");
 
 /// A single provider's submission paired with its consensus weight (stake amount).
 #[contracttype]
@@ -29,30 +39,36 @@ pub fn compact_duplicate_price_rows(
     entries: &Vec<WeightedEntry>,
 ) -> Result<Vec<WeightedEntry>, ContractError> {
     let mut compacted: Vec<WeightedEntry> = Vec::new(env);
-    let mut index_by_value: Map<u64, u64> = Map::new(env);
-
+    // Use a simple linear search for duplicates instead of Map for gas optimization
+    // For small datasets, this is more efficient than Map overhead
+    
     for i in 0..entries.len() {
         let entry = entries.get(i).unwrap();
+        let mut found = false;
+        
+        for j in 0..compacted.len() {
+            let existing = compacted.get(j).unwrap();
+            if existing.value == entry.value {
+                let idx = j;
+                let merged_weight = existing
+                    .weight
+                    .checked_add(entry.weight)
+                    .ok_or(ContractError::Overflow)?;
 
-        if let Some(existing_index) = index_by_value.get(entry.value) {
-            let idx = existing_index as u32;
-            let existing = compacted.get(idx).unwrap();
-            let merged_weight = existing
-                .weight
-                .checked_add(entry.weight)
-                .ok_or(ContractError::Overflow)?;
-
-            compacted.set(
-                idx,
-                WeightedEntry {
-                    value: existing.value,
-                    weight: merged_weight,
-                },
-            );
-        } else {
-            let index = compacted.len() as u64;
+                compacted.set(
+                    idx,
+                    WeightedEntry {
+                        value: existing.value,
+                        weight: merged_weight,
+                    },
+                );
+                found = true;
+                break;
+            }
+        }
+        
+        if !found {
             compacted.push_back(entry.clone());
-            index_by_value.set(entry.value, index);
         }
     }
 
@@ -189,9 +205,29 @@ pub fn mock_oracle_price(env: &Env, _asset: Symbol) -> Result<i64, ContractError
     }
 }
 
+/// Verify that the current ledger sequence falls within the allowed epoch validation window.
+///
+/// Rejects submissions with `ContractError::EpochClosed` if the current
+/// host ledger has advanced past the epoch end, or is before the epoch start.
+pub fn verify_epoch_window(
+    env: &Env,
+    epoch_start: u32,
+    epoch_end: u32,
+) -> Result<(), ContractError> {
+    let current_ledger = env.ledger().sequence();
+    if current_ledger < epoch_start || current_ledger > epoch_end {
+        return Err(ContractError::EpochClosed);
+    }
+    Ok(())
+}
+
 /// Validate and register the sequence of the latest asset update.
 /// Rejects incoming price updates instantly if the incoming tracking sequence
 /// is less than or equal to the active stored checkpoint value.
+pub fn verify_and_update_sequence(env: &Env, asset: Symbol, incoming_sequence: u32) -> Result<(), ContractError> {
+    let seq_key = SequenceKey(asset.clone());
+    
+    if let Some(active_sequence) = env.storage().instance().get(&seq_key) {
 pub fn verify_and_update_sequence(
     env: &Env,
     asset: Symbol,
@@ -209,17 +245,48 @@ pub fn verify_and_update_sequence(
             return Err(ContractError::StaleSequence);
         }
     }
+    
+    env.storage().instance().set(&seq_key, &incoming_sequence);
 
     tracker.set(asset, incoming_sequence);
     env.storage().instance().set(&key, &tracker);
     Ok(())
 }
 
+/// Validate and enforce minimum block height gap between consecutive submissions.
+/// Rejects incoming transaction payloads if the current network ledger index has not
+/// progressed by at least MIN_BLOCK_GAP_THRESHOLD blocks since the node's last successful entry.
+///
+/// This prevents ledger bloat and reduces gas fees from rapid telemetry updates within
+/// a singular block index window.
+pub fn verify_and_update_block_gap(
+    env: &Env,
+    node: Address,
+) -> Result<(), ContractError> {
+    let current_ledger_index = env.ledger().sequence();
+    let mut block_tracker: Map<Address, u32> = env
+        .storage()
+        .instance()
+        .get(&BLOCK_TRACKER_KEY)
+        .unwrap_or_else(|| Map::new(env));
+
+    if let Some(last_ledger_index) = block_tracker.get(node.clone()) {
+        let gap = current_ledger_index.saturating_sub(last_ledger_index);
+        if gap < MIN_BLOCK_GAP_THRESHOLD {
+            return Err(ContractError::StaleSequence);
+        }
+    }
+
+    block_tracker.set(node, current_ledger_index);
+    env.storage().instance().set(&BLOCK_TRACKER_KEY, &block_tracker);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     fn make_entries(env: &Env, pairs: &[(u64, u64)]) -> Vec<WeightedEntry> {
         let mut v = Vec::new(env);
@@ -447,5 +514,41 @@ mod tests {
             let events = env.events().all();
             assert!(events.len() > 0);
         });
+    }
+
+    #[test]
+    fn test_verify_epoch_window_success() {
+        let env = Env::default();
+        env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+            timestamp: 0,
+            protocol_version: 0,
+            sequence_number: 100,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_temp_entry_ttl: 0,
+            min_persistent_entry_ttl: 0,
+            max_entry_ttl: 0,
+        });
+        
+        assert_eq!(verify_epoch_window(&env, 90, 110), Ok(()));
+        assert_eq!(verify_epoch_window(&env, 100, 100), Ok(()));
+    }
+
+    #[test]
+    fn test_verify_epoch_window_closed() {
+        let env = Env::default();
+        env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+            timestamp: 0,
+            protocol_version: 0,
+            sequence_number: 100,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_temp_entry_ttl: 0,
+            min_persistent_entry_ttl: 0,
+            max_entry_ttl: 0,
+        });
+        
+        assert_eq!(verify_epoch_window(&env, 101, 120), Err(ContractError::EpochClosed));
+        assert_eq!(verify_epoch_window(&env, 80, 99), Err(ContractError::EpochClosed));
     }
 }
