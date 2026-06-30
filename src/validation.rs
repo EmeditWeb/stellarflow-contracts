@@ -18,9 +18,9 @@
 //! from sufficiently liquid markets that cannot be easily manipulated through
 //! temporary capital injection attacks.
 
-use soroban_sdk::{Address, Env, Map, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, Symbol, Vec};
 
-use crate::{ContractError, STAKE_REGISTRY_KEY};
+use crate::{AssetId, ContractError, STAKE_REGISTRY_KEY};
 
 /// Minimum stake (in the same units as `StakeRecord.amount`) required to
 /// update a validator profile for a premium asset pool.
@@ -525,5 +525,233 @@ mod validation_tests {
 
         // Should be rejected due to insufficient reserves
         assert_eq!(result, Err(ContractError::InsufficientReserveBalance));
+    }
+}
+
+#[cfg(test)]
+mod bundle_processing_tests {
+    use super::*;
+    use crate::TimeLockedUpgradeContract;
+    use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
+
+    fn setup_env() -> Env {
+        let env = Env::default();
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 0,
+            min_persistent_entry_ttl: 0,
+            max_entry_ttl: u32::MAX,
+        });
+        env
+    }
+
+    fn make_update(asset: AssetId, price: u64, timestamp: u64) -> AssetPriceUpdate {
+        AssetPriceUpdate {
+            asset,
+            price,
+            timestamp,
+        }
+    }
+
+    fn setup_contract_client<'a>(env: &'a Env, contract_id: &Address) -> (crate::TimeLockedUpgradeContractClient<'a>, Address) {
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let client = crate::TimeLockedUpgradeContractClient::new(env, contract_id);
+        client.initialize(&admin, &treasury);
+        (client, admin)
+    }
+
+    fn setup_env_with_contract() -> (Env, Address) {
+        let env = setup_env();
+        let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+        (env, contract_id)
+    }
+
+    // ── build_bundle_index tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_build_bundle_index_empty() {
+        let env = setup_env();
+        let updates: Vec<AssetPriceUpdate> = Vec::new(&env);
+        let index = build_bundle_index(&env, &updates).unwrap();
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_build_bundle_index_single_asset() {
+        let env = setup_env();
+        let mut updates: Vec<AssetPriceUpdate> = Vec::new(&env);
+        updates.push_back(make_update(3897123275, 100_000, 999_980));
+        let index = build_bundle_index(&env, &updates).unwrap();
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.get(0).unwrap().asset, 3897123275);
+    }
+
+    #[test]
+    fn test_build_bundle_index_precomputes_symbol_and_timestamp() {
+        let env = setup_env();
+        let mut updates: Vec<AssetPriceUpdate> = Vec::new(&env);
+        updates.push_back(make_update(3897123275, 100_000, 999_980));
+        let index = build_bundle_index(&env, &updates).unwrap();
+        assert_eq!(index.get(0).unwrap().pool_symbol, symbol_short!("NGN"));
+        assert_eq!(index.get(0).unwrap().timestamp, 999_980);
+    }
+
+    #[test]
+    fn test_build_bundle_index_exceeds_max() {
+        let env = setup_env();
+        let mut updates: Vec<AssetPriceUpdate> = Vec::new(&env);
+        for i in 0..MAX_BUNDLE_ASSETS + 1 {
+            updates.push_back(make_update(i, 100_000, 999_980));
+        }
+        let result = build_bundle_index(&env, &updates);
+        assert_eq!(result, Err(ContractError::BundleAssetLimitExceeded));
+    }
+
+    #[test]
+    fn test_build_bundle_index_at_max_boundary() {
+        let env = setup_env();
+        let mut updates: Vec<AssetPriceUpdate> = Vec::new(&env);
+        for i in 0..MAX_BUNDLE_ASSETS {
+            updates.push_back(make_update(i, 100_000, 999_980));
+        }
+        let index = build_bundle_index(&env, &updates).unwrap();
+        assert_eq!(index.len(), MAX_BUNDLE_ASSETS);
+    }
+
+    // ── process_price_bundle tests ────────────────────────────────────────
+
+    #[test]
+    fn test_process_price_bundle_single_asset_passes() {
+        let (env, contract_id) = setup_env_with_contract();
+        env.mock_all_auths();
+        let (client, node) = setup_contract_client(&env, &contract_id);
+        client.stake_and_register(&node, &PREMIUM_POOL_MIN_STAKE);
+
+        let mut updates: Vec<AssetPriceUpdate> = Vec::new(&env);
+        updates.push_back(make_update(3897123275, 100_000, 999_980));
+
+        let result = client.update_prices_bundle(&node, &updates);
+        assert_eq!(result.total_assets, 1);
+        assert_eq!(result.accepted, 1);
+    }
+
+    #[test]
+    fn test_process_price_bundle_multiple_assets_passes() {
+        let (env, contract_id) = setup_env_with_contract();
+        env.mock_all_auths();
+        let (client, node) = setup_contract_client(&env, &contract_id);
+        client.stake_and_register(&node, &PREMIUM_POOL_MIN_STAKE);
+
+        let mut updates: Vec<AssetPriceUpdate> = Vec::new(&env);
+        updates.push_back(make_update(3897123275, 100_000, 999_980));
+        updates.push_back(make_update(2654435761, 200_000, 999_970));
+        updates.push_back(make_update(4026531840, 150_000, 999_960));
+
+        let result = client.update_prices_bundle(&node, &updates);
+        assert_eq!(result.total_assets, 3);
+        assert_eq!(result.accepted, 3);
+    }
+
+    #[test]
+    fn test_process_price_bundle_exceeds_max_assets_rejected() {
+        let (env, contract_id) = setup_env_with_contract();
+        env.mock_all_auths();
+        let (client, node) = setup_contract_client(&env, &contract_id);
+
+        let mut updates: Vec<AssetPriceUpdate> = Vec::new(&env);
+        for i in 0..MAX_BUNDLE_ASSETS + 1 {
+            updates.push_back(make_update(i, 100_000, 999_980));
+        }
+
+        let result = client.try_update_prices_bundle(&node, &updates);
+        assert_eq!(result, Err(Ok(ContractError::BundleAssetLimitExceeded)));
+    }
+
+    #[test]
+    fn test_process_price_bundle_insufficient_stake_rejected() {
+        let (env, contract_id) = setup_env_with_contract();
+        env.mock_all_auths();
+        let (client, node) = setup_contract_client(&env, &contract_id);
+        client.stake_and_register(&node, &(PREMIUM_POOL_MIN_STAKE - 1));
+
+        let mut updates: Vec<AssetPriceUpdate> = Vec::new(&env);
+        updates.push_back(make_update(3897123275, 100_000, 999_980));
+
+        let result = client.try_update_prices_bundle(&node, &updates);
+        assert_eq!(result, Err(Ok(ContractError::PremiumPoolAccessDenied)));
+    }
+
+    #[test]
+    fn test_process_price_bundle_stale_payload_rejected() {
+        let (env, contract_id) = setup_env_with_contract();
+        env.mock_all_auths();
+        let (client, node) = setup_contract_client(&env, &contract_id);
+        client.stake_and_register(&node, &PREMIUM_POOL_MIN_STAKE);
+
+        let mut updates: Vec<AssetPriceUpdate> = Vec::new(&env);
+        updates.push_back(make_update(3897123275, 100_000, 999_939));
+
+        let result = client.try_update_prices_bundle(&node, &updates);
+        assert_eq!(result, Err(Ok(ContractError::StaleTelemetryPayload)));
+    }
+
+    #[test]
+    fn test_process_price_bundle_mixed_freshness_rejected_on_first_stale() {
+        let (env, contract_id) = setup_env_with_contract();
+        env.mock_all_auths();
+        let (client, node) = setup_contract_client(&env, &contract_id);
+        client.stake_and_register(&node, &PREMIUM_POOL_MIN_STAKE);
+
+        let mut updates: Vec<AssetPriceUpdate> = Vec::new(&env);
+        updates.push_back(make_update(3897123275, 100_000, 999_939));
+        updates.push_back(make_update(2654435761, 200_000, 999_980));
+
+        let result = client.try_update_prices_bundle(&node, &updates);
+        assert_eq!(result, Err(Ok(ContractError::StaleTelemetryPayload)));
+    }
+
+    // ── asset_id_to_symbol_short tests ────────────────────────────────────
+
+    #[test]
+    fn test_asset_id_to_symbol_short_known_ids() {
+        assert_eq!(
+            asset_id_to_symbol_short(3897123275),
+            symbol_short!("NGN")
+        );
+        assert_eq!(
+            asset_id_to_symbol_short(2654435761),
+            symbol_short!("KES")
+        );
+        assert_eq!(
+            asset_id_to_symbol_short(4026531840),
+            symbol_short!("GHS")
+        );
+        assert_eq!(
+            asset_id_to_symbol_short(4160749568),
+            symbol_short!("CFA")
+        );
+        assert_eq!(
+            asset_id_to_symbol_short(3219226362),
+            symbol_short!("ZAR")
+        );
+        assert_eq!(
+            asset_id_to_symbol_short(2863311530),
+            symbol_short!("UGX")
+        );
+        assert_eq!(asset_id_to_symbol_short(0), symbol_short!("STAKE"));
+        assert_eq!(asset_id_to_symbol_short(1), symbol_short!("VALUE"));
+    }
+
+    #[test]
+    fn test_asset_id_to_symbol_short_unknown_returns_unk() {
+        assert_eq!(
+            asset_id_to_symbol_short(999_999),
+            symbol_short!("UNK")
+        );
     }
 }
