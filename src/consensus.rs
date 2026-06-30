@@ -1,42 +1,18 @@
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
+use crate::ContractError;
+use crate::storage::SequenceKey;
 use crate::ContractError;
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, Symbol, Vec};
 
 /// Basis-point denominator used when converting a BPS fraction to a multiplier.
 pub const BPS_DENOMINATOR: u64 = 10_000;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// State-isolation storage keys
-// ─────────────────────────────────────────────────────────────────────────────
+/// Minimum safety threshold for block height gaps between consecutive submissions.
+/// Prevents ledger bloat from rapid telemetry updates within the same block window.
+pub const MIN_BLOCK_GAP_THRESHOLD: u32 = 3;
 
-/// Per-asset composite key for the **active** epoch sequence checkpoint.
-///
-/// Replaces the monolithic `Map<Symbol, u32>` stored under the flat `"SEQ_TRK"`
-/// key. Each asset's live sequence counter now occupies its own isolated
-/// instance-storage slot, so a single-asset lookup never deserializes sequence
-/// data for every other tracked asset.
-///
-/// Layout: `ConsensusSeq(asset_symbol)` → `u32`
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ConsensusStorageKey {
-    /// Active epoch sequence checkpoint for a single asset.
-    ///
-    /// Written on every accepted ingestion event; read on every incoming
-    /// submission to enforce the monotone-sequence invariant.
-    ConsensusSeq(Symbol),
-
-    /// Archival ingestion-history record for a single asset.
-    ///
-    /// Stores the *previous* accepted sequence number immediately before it is
-    /// overwritten by a new checkpoint. This offloads past validation metadata
-    /// to a dedicated archival key so it is never touched by the hot-path
-    /// `verify_and_update_sequence` read, minimising ledger fee overhead during
-    /// dynamic configuration lookups.
-    ///
-    /// Consumers that need audit trails or replay protection for past epochs
-    /// read from this key; active consensus logic reads only `ConsensusSeq`.
-    EpochSeqArchive(Symbol),
-}
+/// Storage key for tracking the last successful ledger index per node.
+pub(crate) const BLOCK_TRACKER_KEY: Symbol = symbol_short!("BLKTRK");
 
 /// A single provider's submission paired with its consensus weight (stake amount).
 #[contracttype]
@@ -63,30 +39,36 @@ pub fn compact_duplicate_price_rows(
     entries: &Vec<WeightedEntry>,
 ) -> Result<Vec<WeightedEntry>, ContractError> {
     let mut compacted: Vec<WeightedEntry> = Vec::new(env);
-    let mut index_by_value: Map<u64, u64> = Map::new(env);
-
+    // Use a simple linear search for duplicates instead of Map for gas optimization
+    // For small datasets, this is more efficient than Map overhead
+    
     for i in 0..entries.len() {
         let entry = entries.get(i).unwrap();
+        let mut found = false;
+        
+        for j in 0..compacted.len() {
+            let existing = compacted.get(j).unwrap();
+            if existing.value == entry.value {
+                let idx = j;
+                let merged_weight = existing
+                    .weight
+                    .checked_add(entry.weight)
+                    .ok_or(ContractError::Overflow)?;
 
-        if let Some(existing_index) = index_by_value.get(entry.value) {
-            let idx = existing_index as u32;
-            let existing = compacted.get(idx).unwrap();
-            let merged_weight = existing
-                .weight
-                .checked_add(entry.weight)
-                .ok_or(ContractError::Overflow)?;
-
-            compacted.set(
-                idx,
-                WeightedEntry {
-                    value: existing.value,
-                    weight: merged_weight,
-                },
-            );
-        } else {
-            let index = compacted.len() as u64;
+                compacted.set(
+                    idx,
+                    WeightedEntry {
+                        value: existing.value,
+                        weight: merged_weight,
+                    },
+                );
+                found = true;
+                break;
+            }
+        }
+        
+        if !found {
             compacted.push_back(entry.clone());
-            index_by_value.set(entry.value, index);
         }
     }
 
@@ -223,33 +205,29 @@ pub fn mock_oracle_price(env: &Env, _asset: Symbol) -> Result<i64, ContractError
     }
 }
 
+/// Verify that the current ledger sequence falls within the allowed epoch validation window.
+///
+/// Rejects submissions with `ContractError::EpochClosed` if the current
+/// host ledger has advanced past the epoch end, or is before the epoch start.
+pub fn verify_epoch_window(
+    env: &Env,
+    epoch_start: u32,
+    epoch_end: u32,
+) -> Result<(), ContractError> {
+    let current_ledger = env.ledger().sequence();
+    if current_ledger < epoch_start || current_ledger > epoch_end {
+        return Err(ContractError::EpochClosed);
+    }
+    Ok(())
+}
+
 /// Validate and register the sequence of the latest asset update.
-///
-/// # State-isolation model
-///
-/// The previous implementation stored a flat `Map<Symbol, u32>` under a single
-/// `"SEQ_TRK"` instance-storage key. Every call — regardless of which asset was
-/// targeted — had to deserialize the **entire** map, causing state inflation and
-/// unnecessary ledger fee overhead as the tracked-asset set grew.
-///
-/// This refactored version uses per-asset composite storage keys:
-///
-/// - **`ConsensusStorageKey::ConsensusSeq(asset)`** — the active epoch sequence
-///   checkpoint for the asset being validated.  Only this single slot is read or
-///   written on every call, keeping the hot-path memory footprint O(1) per asset.
-///
-/// - **`ConsensusStorageKey::EpochSeqArchive(asset)`** — receives the *previous*
-///   accepted sequence value immediately before the checkpoint is advanced.  Past
-///   validation history is thus offloaded to a dedicated archival key that the
-///   active consensus path never touches, eliminating stale ingestion history
-///   from the main operational storage partition.
-///
-/// # Behaviour
-///
-/// Rejects `incoming_sequence` if it is ≤ the active stored checkpoint
-/// (`ContractError::StaleSequence`).  On acceptance, the old checkpoint is
-/// archived before the new one is committed, so both the live state and the
-/// full audit trail are always consistent.
+/// Rejects incoming price updates instantly if the incoming tracking sequence
+/// is less than or equal to the active stored checkpoint value.
+pub fn verify_and_update_sequence(env: &Env, asset: Symbol, incoming_sequence: u32) -> Result<(), ContractError> {
+    let seq_key = SequenceKey(asset.clone());
+    
+    if let Some(active_sequence) = env.storage().instance().get(&seq_key) {
 pub fn verify_and_update_sequence(
     env: &Env,
     asset: Symbol,
@@ -271,41 +249,48 @@ pub fn verify_and_update_sequence(
         let archive_key = ConsensusStorageKey::EpochSeqArchive(asset.clone());
         env.storage().instance().set(&archive_key, &current);
     }
+    
+    env.storage().instance().set(&seq_key, &incoming_sequence);
 
     // ── Write the new active checkpoint (isolated from archival history) ──────
     env.storage().instance().set(&active_key, &incoming_sequence);
     Ok(())
 }
 
-/// Read the current active epoch sequence checkpoint for an asset.
+/// Validate and enforce minimum block height gap between consecutive submissions.
+/// Rejects incoming transaction payloads if the current network ledger index has not
+/// progressed by at least MIN_BLOCK_GAP_THRESHOLD blocks since the node's last successful entry.
 ///
-/// Returns `None` when no submission has been accepted yet for `asset`.
-/// Reads only the `ConsensusSeq(asset)` slot — never touches archival history.
-pub fn get_active_sequence(env: &Env, asset: Symbol) -> Option<u32> {
-    env.storage()
+/// This prevents ledger bloat and reduces gas fees from rapid telemetry updates within
+/// a singular block index window.
+pub fn verify_and_update_block_gap(
+    env: &Env,
+    node: Address,
+) -> Result<(), ContractError> {
+    let current_ledger_index = env.ledger().sequence();
+    let mut block_tracker: Map<Address, u32> = env
+        .storage()
         .instance()
-        .get(&ConsensusStorageKey::ConsensusSeq(asset))
-}
+        .get(&BLOCK_TRACKER_KEY)
+        .unwrap_or_else(|| Map::new(env));
 
-/// Read the most recently archived (previous epoch) sequence checkpoint for an asset.
-///
-/// Returns `None` when the asset has never had more than one accepted ingestion
-/// event (i.e. the archive has not been written yet).
-///
-/// This is the designated access point for audit trails, replay-protection
-/// checks, and any consumer that needs past validation history.  The active
-/// consensus path never calls this function.
-pub fn get_archived_sequence(env: &Env, asset: Symbol) -> Option<u32> {
-    env.storage()
-        .instance()
-        .get(&ConsensusStorageKey::EpochSeqArchive(asset))
+    if let Some(last_ledger_index) = block_tracker.get(node.clone()) {
+        let gap = current_ledger_index.saturating_sub(last_ledger_index);
+        if gap < MIN_BLOCK_GAP_THRESHOLD {
+            return Err(ContractError::StaleSequence);
+        }
+    }
+
+    block_tracker.set(node, current_ledger_index);
+    env.storage().instance().set(&BLOCK_TRACKER_KEY, &block_tracker);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     fn make_entries(env: &Env, pairs: &[(u64, u64)]) -> Vec<WeightedEntry> {
         let mut v = Vec::new(env);
@@ -647,5 +632,41 @@ mod tests {
             let events = env.events().all();
             assert!(events.len() > 0);
         });
+    }
+
+    #[test]
+    fn test_verify_epoch_window_success() {
+        let env = Env::default();
+        env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+            timestamp: 0,
+            protocol_version: 0,
+            sequence_number: 100,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_temp_entry_ttl: 0,
+            min_persistent_entry_ttl: 0,
+            max_entry_ttl: 0,
+        });
+        
+        assert_eq!(verify_epoch_window(&env, 90, 110), Ok(()));
+        assert_eq!(verify_epoch_window(&env, 100, 100), Ok(()));
+    }
+
+    #[test]
+    fn test_verify_epoch_window_closed() {
+        let env = Env::default();
+        env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+            timestamp: 0,
+            protocol_version: 0,
+            sequence_number: 100,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_temp_entry_ttl: 0,
+            min_persistent_entry_ttl: 0,
+            max_entry_ttl: 0,
+        });
+        
+        assert_eq!(verify_epoch_window(&env, 101, 120), Err(ContractError::EpochClosed));
+        assert_eq!(verify_epoch_window(&env, 80, 99), Err(ContractError::EpochClosed));
     }
 }
