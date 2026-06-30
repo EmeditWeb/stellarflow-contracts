@@ -237,6 +237,9 @@ pub fn get_last_validation_timestamp(env: &Env, asset: &Symbol) -> Option<u64> {
 ///
 /// This prevents accepting a finalized consensus price when the active input
 /// pool has collapsed below the minimum safe participation threshold.
+///
+/// Returns `Err(ContractError::MinimumQuorumNotMet)` if fewer than 3 unique
+/// node operators have submitted data points during the current cycle window.
 pub fn validate_consensus_quorum(env: &Env, buffer: &crate::types::PriceBuffer) -> Result<(), ContractError> {
     let mut unique_sources = soroban_sdk::Map::new(env);
 
@@ -245,7 +248,7 @@ pub fn validate_consensus_quorum(env: &Env, buffer: &crate::types::PriceBuffer) 
     }
 
     if unique_sources.len() < 3 {
-        return Err(ContractError::IncompleteQuorum);
+        return Err(ContractError::MinimumQuorumNotMet);
     }
 
     Ok(())

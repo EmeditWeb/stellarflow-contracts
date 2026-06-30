@@ -560,7 +560,7 @@ pub enum ContractError {
     /// Invalid slippage tolerance - must be between 0 and 10000 basis points (0-100%).
     InvalidSlippageTolerance = 11,
     /// Fewer than three independent node sources contributed to the current consensus pool.
-    IncompleteQuorum = 12,
+    MinimumQuorumNotMet = 12,
     /// The circuit-breaker is active — price reads for high-volatility assets are blocked.
     CircuitBreakerActive = 13,
     /// The circuit-breaker is already active; cannot trip it again until it is reset.
