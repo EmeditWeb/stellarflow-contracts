@@ -233,23 +233,27 @@ pub fn verify_and_update_sequence(
     asset: Symbol,
     incoming_sequence: u32,
 ) -> Result<(), ContractError> {
-    let key = symbol_short!("SEQ_TRK");
-    let mut tracker: Map<Symbol, u32> = env
-        .storage()
-        .instance()
-        .get(&key)
-        .unwrap_or_else(|| Map::new(env));
+    // ── Active epoch read (O(1) — single composite-key slot) ─────────────────
+    let active_key = ConsensusStorageKey::ConsensusSeq(asset.clone());
+    let active_sequence: Option<u32> = env.storage().instance().get(&active_key);
 
-    if let Some(active_sequence) = tracker.get(asset.clone()) {
-        if incoming_sequence <= active_sequence {
+    // Monotone-sequence invariant: reject stale or duplicate submissions.
+    if let Some(current) = active_sequence {
+        if incoming_sequence <= current {
             return Err(ContractError::StaleSequence);
         }
+
+        // ── Archive the outgoing checkpoint before overwriting ────────────────
+        // The previous sequence value is offloaded to the dedicated archival
+        // partition so it is never loaded by subsequent active-epoch reads.
+        let archive_key = ConsensusStorageKey::EpochSeqArchive(asset.clone());
+        env.storage().instance().set(&archive_key, &current);
     }
     
     env.storage().instance().set(&seq_key, &incoming_sequence);
 
-    tracker.set(asset, incoming_sequence);
-    env.storage().instance().set(&key, &tracker);
+    // ── Write the new active checkpoint (isolated from archival history) ──────
+    env.storage().instance().set(&active_key, &incoming_sequence);
     Ok(())
 }
 
@@ -463,7 +467,121 @@ mod tests {
         assert_eq!(result, Err(ContractError::Overflow));
     }
 
-    // --- get_price_with_fallback tests ---
+    // --- verify_and_update_sequence (refactored: state-isolated composite keys) ---
+
+    #[test]
+    fn test_sequence_first_submission_accepted() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
+        env.as_contract(&contract_id, || {
+            let asset = symbol_short!("NGN");
+            // First submission — no prior checkpoint, must succeed.
+            assert!(verify_and_update_sequence(&env, asset.clone(), 1).is_ok());
+            // Active checkpoint written to isolated composite slot.
+            assert_eq!(get_active_sequence(&env, asset.clone()), Some(1));
+            // Archive slot untouched (no previous value to archive).
+            assert_eq!(get_archived_sequence(&env, asset), None);
+        });
+    }
+
+    #[test]
+    fn test_sequence_advance_archives_previous_checkpoint() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
+        env.as_contract(&contract_id, || {
+            let asset = symbol_short!("KES");
+            // Establish initial checkpoint.
+            verify_and_update_sequence(&env, asset.clone(), 10).unwrap();
+            // Advance to a higher sequence — old value should be archived.
+            verify_and_update_sequence(&env, asset.clone(), 20).unwrap();
+
+            assert_eq!(get_active_sequence(&env, asset.clone()), Some(20));
+            // Previous checkpoint (10) is now in the archival partition.
+            assert_eq!(get_archived_sequence(&env, asset), Some(10));
+        });
+    }
+
+    #[test]
+    fn test_sequence_stale_rejected() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
+        env.as_contract(&contract_id, || {
+            let asset = symbol_short!("GHS");
+            verify_and_update_sequence(&env, asset.clone(), 5).unwrap();
+            // Equal-to-active is stale.
+            assert_eq!(
+                verify_and_update_sequence(&env, asset.clone(), 5),
+                Err(ContractError::StaleSequence)
+            );
+            // Less-than-active is stale.
+            assert_eq!(
+                verify_and_update_sequence(&env, asset.clone(), 4),
+                Err(ContractError::StaleSequence)
+            );
+            // Active checkpoint unchanged after rejection.
+            assert_eq!(get_active_sequence(&env, asset), Some(5));
+        });
+    }
+
+    #[test]
+    fn test_sequence_isolation_between_assets() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
+        env.as_contract(&contract_id, || {
+            let ngn = symbol_short!("NGN");
+            let kes = symbol_short!("KES");
+            verify_and_update_sequence(&env, ngn.clone(), 100).unwrap();
+            verify_and_update_sequence(&env, kes.clone(), 200).unwrap();
+
+            // Each asset's active sequence is stored in its own isolated slot.
+            assert_eq!(get_active_sequence(&env, ngn.clone()), Some(100));
+            assert_eq!(get_active_sequence(&env, kes.clone()), Some(200));
+
+            // Advancing one asset's sequence does not affect the other.
+            verify_and_update_sequence(&env, ngn.clone(), 150).unwrap();
+            assert_eq!(get_active_sequence(&env, kes), Some(200));
+            assert_eq!(get_archived_sequence(&env, ngn), Some(100));
+        });
+    }
+
+    #[test]
+    fn test_archive_only_retains_most_recent_previous_checkpoint() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
+        env.as_contract(&contract_id, || {
+            let asset = symbol_short!("CFA");
+            verify_and_update_sequence(&env, asset.clone(), 1).unwrap();
+            verify_and_update_sequence(&env, asset.clone(), 2).unwrap();
+            // Archive holds 1 (previous before 2).
+            assert_eq!(get_archived_sequence(&env, asset.clone()), Some(1));
+            verify_and_update_sequence(&env, asset.clone(), 3).unwrap();
+            // Archive now holds 2 (previous before 3); 1 is no longer present.
+            assert_eq!(get_archived_sequence(&env, asset.clone()), Some(2));
+            assert_eq!(get_active_sequence(&env, asset), Some(3));
+        });
+    }
+
+    #[test]
+    fn test_get_active_sequence_returns_none_before_any_submission() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
+        env.as_contract(&contract_id, || {
+            let asset = symbol_short!("ZAR");
+            assert_eq!(get_active_sequence(&env, asset), None);
+        });
+    }
+
+    #[test]
+    fn test_get_archived_sequence_returns_none_after_single_submission() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
+        env.as_contract(&contract_id, || {
+            let asset = symbol_short!("UGX");
+            verify_and_update_sequence(&env, asset.clone(), 7).unwrap();
+            // Only one submission: archive slot was never written.
+            assert_eq!(get_archived_sequence(&env, asset), None);
+        });
+    }
 
     #[test]
     fn test_get_price_with_fallback_success() {
