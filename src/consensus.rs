@@ -1,3 +1,6 @@
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
+use crate::ContractError;
+use crate::storage::SequenceKey;
 use crate::ContractError;
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, Symbol, Vec};
 
@@ -36,30 +39,36 @@ pub fn compact_duplicate_price_rows(
     entries: &Vec<WeightedEntry>,
 ) -> Result<Vec<WeightedEntry>, ContractError> {
     let mut compacted: Vec<WeightedEntry> = Vec::new(env);
-    let mut index_by_value: Map<u64, u64> = Map::new(env);
-
+    // Use a simple linear search for duplicates instead of Map for gas optimization
+    // For small datasets, this is more efficient than Map overhead
+    
     for i in 0..entries.len() {
         let entry = entries.get(i).unwrap();
+        let mut found = false;
+        
+        for j in 0..compacted.len() {
+            let existing = compacted.get(j).unwrap();
+            if existing.value == entry.value {
+                let idx = j;
+                let merged_weight = existing
+                    .weight
+                    .checked_add(entry.weight)
+                    .ok_or(ContractError::Overflow)?;
 
-        if let Some(existing_index) = index_by_value.get(entry.value) {
-            let idx = existing_index as u32;
-            let existing = compacted.get(idx).unwrap();
-            let merged_weight = existing
-                .weight
-                .checked_add(entry.weight)
-                .ok_or(ContractError::Overflow)?;
-
-            compacted.set(
-                idx,
-                WeightedEntry {
-                    value: existing.value,
-                    weight: merged_weight,
-                },
-            );
-        } else {
-            let index = compacted.len() as u64;
+                compacted.set(
+                    idx,
+                    WeightedEntry {
+                        value: existing.value,
+                        weight: merged_weight,
+                    },
+                );
+                found = true;
+                break;
+            }
+        }
+        
+        if !found {
             compacted.push_back(entry.clone());
-            index_by_value.set(entry.value, index);
         }
     }
 
@@ -215,6 +224,10 @@ pub fn verify_epoch_window(
 /// Validate and register the sequence of the latest asset update.
 /// Rejects incoming price updates instantly if the incoming tracking sequence
 /// is less than or equal to the active stored checkpoint value.
+pub fn verify_and_update_sequence(env: &Env, asset: Symbol, incoming_sequence: u32) -> Result<(), ContractError> {
+    let seq_key = SequenceKey(asset.clone());
+    
+    if let Some(active_sequence) = env.storage().instance().get(&seq_key) {
 pub fn verify_and_update_sequence(
     env: &Env,
     asset: Symbol,
@@ -232,6 +245,8 @@ pub fn verify_and_update_sequence(
             return Err(ContractError::StaleSequence);
         }
     }
+    
+    env.storage().instance().set(&seq_key, &incoming_sequence);
 
     tracker.set(asset, incoming_sequence);
     env.storage().instance().set(&key, &tracker);

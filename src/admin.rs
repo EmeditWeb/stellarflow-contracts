@@ -1,3 +1,6 @@
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
+use crate::{ContractData, ContractError, DATA_KEY, SIGNERS_KEY, REVOKED_SIGNER_KEY};
+use crate::storage::{SignerKey, RevokedSignerKey};
 use crate::{ContractData, ContractError, DATA_KEY, REVOKED_SIGNER_KEY, SIGNERS_KEY};
 use crate::temp_governance::{
     store_temp_proposal, get_temp_proposal, has_temp_proposal, remove_temp_proposal,
@@ -47,7 +50,8 @@ pub struct EmergencyRevocationProposal {
     /// Ledger timestamp at proposal time (informational / audit trail).
     pub proposed_at: u64,
     /// Set of addresses that have already voted `aye` on this proposal.
-    pub votes: Map<Address, ()>,
+    /// Using Vec<Address> instead of Map for gas optimization.
+    pub votes: Vec<Address>,
 }
 
 // ── Pending ownership transfer ────────────────────────────────────────────
@@ -125,6 +129,11 @@ pub fn propose_ownership_transfer(
     }
     current_admin.require_auth();
 
+    // Only the admin or a registered signer may open a proposal.
+    let is_signer = _is_signer(env, &proposer);
+    let is_signer = get_signers(env).contains_key(proposer.clone());
+    if data.admin != proposer && !is_signer {
+        return Err(ContractError::Unauthorized);
     if env.storage().instance().has(&PENDING_OWNER_KEY) {
         return Err(ContractError::TransferAlreadyPending);
     }
@@ -135,6 +144,12 @@ pub fn propose_ownership_transfer(
         return Err(ContractError::EmergencyRevocationAlreadyActive);
     }
 
+    // The target must currently be a signer or the admin.
+    let target_is_signer = _is_signer(env, &target);
+    let target_is_signer = get_signers(env).contains_key(target.clone());
+    if data.admin != target && !target_is_signer {
+        return Err(ContractError::TargetNotAdmin);
+    }
 /// Phase 2: nominee claims ownership, proving key access.
 /// Only succeeds when a pending transfer exists and caller is the nominee.
 pub fn claim_ownership(env: &Env, claimer: Address) -> Result<(), ContractError> {
@@ -144,9 +159,9 @@ pub fn claim_ownership(env: &Env, claimer: Address) -> Result<(), ContractError>
         .get(&PENDING_OWNER_KEY)
         .ok_or(ContractError::NoPendingOwner)?;
 
-    let mut votes: Map<Address, ()> = Map::new(env);
+    let mut votes: Vec<Address> = Vec::new(env);
     // The proposer's opening of the proposal counts as their vote.
-    votes.set(proposer.clone(), ());
+    votes.push_back(proposer.clone());
 
     let proposal = EmergencyRevocationProposal {
         target,
@@ -200,6 +215,7 @@ pub fn propose_admin_change(
         .ok_or(ContractError::NotInitialized)?;
 
     // Only the admin or a registered signer may vote.
+    let is_signer = _is_signer(env, &voter);
     let is_signer = get_signers(env).contains_key(voter.clone());
     if data.admin != voter && !is_signer {
         return Err(ContractError::Unauthorized);
@@ -210,8 +226,10 @@ pub fn propose_admin_change(
         .ok_or(ContractError::NoActiveEmergencyRevocation)?;
 
     // Prevent double-voting.
-    if proposal.votes.contains_key(voter.clone()) {
-        return Err(ContractError::AlreadyVoted);
+    for i in 0..proposal.votes.len() {
+        if proposal.votes.get(i).unwrap() == voter {
+            return Err(ContractError::AlreadyVoted);
+        }
     }
 
     // The compromised key must never be allowed to vote on its own revocation.
@@ -219,7 +237,7 @@ pub fn propose_admin_change(
         return Err(ContractError::Unauthorized);
     }
 
-    proposal.votes.set(voter, ());
+    proposal.votes.push_back(voter);
 
     let threshold = revocation_threshold(env);
 
@@ -229,6 +247,12 @@ pub fn propose_admin_change(
         // 1. Stamp the target as revoked in persistent storage.
         //    This is the flag that `assert_not_revoked` checks before every
         //    sensitive operation.
+        let revoked_key = RevokedSignerKey(proposal.target.clone());
+        env.storage().instance().set(&revoked_key, &true);
+
+        // 2. Remove the target from the active signer set.
+        let signer_key = SignerKey(proposal.target.clone());
+        env.storage().instance().remove(&signer_key);
         let mut revoked: Map<Address, ()> = env
             .storage()
             .instance()
@@ -244,9 +268,9 @@ pub fn propose_admin_change(
         // 3. Promote the replacement into the signer set (unless it is the
         //    target itself, which would be a no-op replacement).
         if proposal.replacement != proposal.target {
-            signers.set(proposal.replacement.clone(), ());
+            let replacement_key = SignerKey(proposal.replacement.clone());
+            env.storage().instance().set(&replacement_key, &true);
         }
-        env.storage().instance().set(&SIGNERS_KEY, &signers);
 
         // 4. If the compromised key was the admin, transfer admin rights.
         let mut contract_data = data;
@@ -288,6 +312,9 @@ pub fn get_emergency_revocation_proposal(env: &Env) -> Option<EmergencyRevocatio
 /// This is intentionally a pure read — callers that need to *enforce* the
 /// check should call `assert_not_revoked` instead.
 pub fn is_revoked(env: &Env, addr: &Address) -> bool {
+    let revoked_key = RevokedSignerKey(addr.clone());
+    env.storage().instance().has(&revoked_key)
+}
     let revoked: Map<Address, ()> = env
         .storage()
         .instance()
@@ -427,6 +454,16 @@ pub fn has_active_emergency_revocation(env: &Env) -> bool {
     has_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY)
 }
 
+/// Helper function to check if an address is a registered signer.
+fn _is_signer(env: &Env, addr: &Address) -> bool {
+    let signer_key = SignerKey(addr.clone());
+    env.storage().instance().has(&signer_key)
+}
+
+/// Helper function to calculate the revocation threshold.
+fn _revocation_threshold(env: &Env) -> u32 {
+    let signer_count: u32 = env.storage().instance().get(&SIGNERS_KEY).unwrap_or(0u32);
+    if signer_count == 0 { 1 } else { signer_count / 2 + 1 }
 // ─── Issue #410: Admin Storage Isolation via Contextual Instance Storage ──
 //
 // Issue #410 is a state-isolation hardening request: admin configuration
