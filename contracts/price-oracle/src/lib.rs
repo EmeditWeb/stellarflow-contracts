@@ -2236,6 +2236,27 @@ impl PriceOracle {
             }
         }
 
+        // Add the normalized price entry to the buffer, first checking it
+        // falls within the ±15% deviation window against the rolling baseline.
+        let twap_key = DataKey::Twap(asset.clone());
+        let twap_entries: soroban_sdk::Vec<(u64, i128)> = env
+            .storage()
+            .persistent()
+            .get(&twap_key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        let candidate = soroban_sdk::vec![
+            &env,
+            PriceBufferEntry {
+                price: normalized,
+                provider: source.clone(),
+                timestamp: env.ledger().timestamp(),
+            }
+        ];
+        let accepted = validation::filter_feeds_by_deviation(&twap_entries, candidate, &env);
+        if accepted.is_empty() {
+            return Err(Error::FlashCrashDetected);
+        }
+        let entry = accepted.get(0).unwrap();
         // ── Liquidity validation: flash loan manipulation prevention ────────────
         // Validate that the reported pool liquidity meets the configured minimum
         // threshold. This check prevents price manipulation via flash loans or
