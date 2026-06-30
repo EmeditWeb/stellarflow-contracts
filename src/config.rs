@@ -330,7 +330,6 @@ mod tests {
 
         let env = soroban_sdk::Env::default();
         env.mock_all_auths();
-
         let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
         let client = crate::TimeLockedUpgradeContractClient::new(&env, &contract_id);
 
@@ -358,17 +357,17 @@ mod tests {
 
         let env = soroban_sdk::Env::default();
         env.mock_all_auths();
-
         let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
         let client = crate::TimeLockedUpgradeContractClient::new(&env, &contract_id);
 
+        let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
         let admin = Address::generate(&env);
         let intruder = Address::generate(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &treasury);
 
         let result = client.try_set_price_variance_config(&intruder, &PriceVarianceConfig::default());
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(ContractError::NotAdmin)));
     }
 
     #[test]
@@ -378,10 +377,10 @@ mod tests {
 
         let env = soroban_sdk::Env::default();
         env.mock_all_auths();
-
         let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
         let client = crate::TimeLockedUpgradeContractClient::new(&env, &contract_id);
 
+        let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &treasury);
@@ -391,6 +390,9 @@ mod tests {
             ..PriceVarianceConfig::default()
         };
         let result = client.try_set_price_variance_config(&admin, &bad);
-        assert!(result.is_err());
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::InvalidVarianceConfig))
+        );
     }
 }

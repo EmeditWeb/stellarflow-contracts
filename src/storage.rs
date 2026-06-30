@@ -1,5 +1,8 @@
-use soroban_sdk::{contracttype, Address, Env, Symbol};
+use soroban_sdk::{contracttype, Address, Env, Symbol, Map};
+use crate::NodeProfile;
 
+/// Fixed-size tuple-based storage keys for gas-optimized lookups.
+/// Replaces dynamic Map structures with direct tuple keys.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -7,16 +10,76 @@ pub enum DataKey {
     AssetPrice(Symbol),
 }
 
+/// Tuple-based stake storage key: (node_address) -> stake_amount
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StakeKey(Address);
+
+/// Tuple-based heartbeat storage key: (asset_id) -> timestamp
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeartbeatKey(u32);
+
+/// Tuple-based node profile storage key: (node_address) -> NodeProfile
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeProfileKey(Address);
+
+/// Tuple-based signer storage key: (signer_address) -> unit
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignerKey(Address);
+
+/// Tuple-based revoked signer storage key: (revoked_address) -> unit
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevokedSignerKey(Address);
+
+/// Tuple-based sequence tracker key: (asset_symbol) -> sequence_number
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceKey(Symbol);
+
+/// Tuple-based feed stake storage key: (node_address, asset_symbol) -> stake_amount
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedStakeKey(Address, Symbol);
+
+/// Tuple-based asset metrics storage key: (asset_symbol) -> AssetFeedMetrics
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetMetricsKey(Symbol);
+
+/// Tuple-based corridor fee pool storage key: (asset_symbol) -> CorridorFeePool
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorridorFeeKey(Symbol);
+
 pub const RENT_THRESHOLD: u32 = 259_200;
 pub const RENT_EXTEND_TO: u32 = 518_400;
 
 pub const ASSET_TTL_THRESHOLD: u32 = 5_000;
 pub const ASSET_TTL_EXTEND_TO: u32 = 100_000;
 
+pub const PROFILE_TTL_THRESHOLD: u32 = 10_000;
+
+pub fn get_node_profiles(env: &Env) -> Map<Address, NodeProfile> {
+    let key = Symbol::new(env, "NODES");
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PROFILE_TTL_THRESHOLD, env.storage().max_ttl());
+    env.storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Map::new(env))
+}
+
 pub fn extend_subscription_rent(env: &Env, consumer_id: Address) {
     let key = DataKey::Subscription(consumer_id);
     env.storage().persistent().extend_ttl(&key, RENT_THRESHOLD, RENT_EXTEND_TO);
 }
+
+pub fn preflight_rent_check(_env: &Env) {}
 
 pub fn check_subscription(env: &Env, consumer_id: Address) -> bool {
     let key = DataKey::Subscription(consumer_id.clone());
@@ -28,6 +91,11 @@ pub fn check_subscription(env: &Env, consumer_id: Address) -> bool {
     }
 }
 
+/// Pre-flight rent check for storage entries
+pub fn preflight_rent_check(env: &Env) {
+    // This hook can be extended to check TTL of critical storage entries
+    // before executing operations that depend on them.
+    // Currently a no-op placeholder for future rent management.
 pub fn extend_asset_rent(env: &Env, asset: Symbol) -> bool {
     let key = DataKey::AssetPrice(asset);
     if env.storage().persistent().has(&key) {
@@ -42,58 +110,3 @@ pub fn preflight_rent_check(env: &Env) {
     env.storage().instance().extend_ttl(0, ASSET_TTL_THRESHOLD);
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FeedStakeValue {
-    pub amount: u64,
-    pub last_active: u64,
-}
-
-pub fn check_and_prune_feed_stake(env: &Env, node: Address, asset: u32) -> bool {
-    let key = crate::StakingStorageKey::FeedStake(node.clone(), asset);
-    if !env.storage().persistent().has(&key) {
-        return false;
-    }
-
-    let val: FeedStakeValue = env.storage().persistent().get(&key).unwrap();
-    let elapsed = env.ledger().timestamp().saturating_sub(val.last_active);
-
-    if elapsed > RENT_THRESHOLD as u64 {
-        env.storage().persistent().remove(&key);
-
-        let mut stakes: soroban_sdk::Map<Address, u64> = env
-            .storage()
-            .instance()
-            .get(&crate::STAKE_REGISTRY_KEY)
-            .unwrap_or_else(|| soroban_sdk::Map::new(env));
-        let node_total = stakes.get(node.clone()).unwrap_or(0);
-        let new_node_total = node_total.saturating_sub(val.amount);
-        if new_node_total == 0 {
-            stakes.remove(node.clone());
-        } else {
-            stakes.set(node.clone(), new_node_total);
-        }
-        env.storage().instance().set(&crate::STAKE_REGISTRY_KEY, &stakes);
-
-        let total: u64 = env
-            .storage()
-            .instance()
-            .get(&crate::TOTAL_STAKED_KEY)
-            .unwrap_or(0u64);
-        let new_total = total.saturating_sub(val.amount);
-        env.storage().instance().set(&crate::TOTAL_STAKED_KEY, &new_total);
-
-        true
-    } else {
-        false
-    }
-}
-
-pub fn update_feed_stake_activity(env: &Env, node: Address, asset: u32) {
-    let key = crate::StakingStorageKey::FeedStake(node, asset);
-    if let Some(mut val) = env.storage().persistent().get::<_, FeedStakeValue>(&key) {
-        val.last_active = env.ledger().timestamp();
-        env.storage().persistent().set(&key, &val);
-        env.storage().persistent().extend_ttl(&key, RENT_THRESHOLD, RENT_EXTEND_TO);
-    }
-}
