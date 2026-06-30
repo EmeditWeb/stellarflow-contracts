@@ -473,7 +473,7 @@ impl TimeLockedUpgradeContract {
     ) -> Result<(), ContractError> {
         node.require_auth();
         check_bond_capacity(&env, &node, &pool)?;
-        Self::_record_heartbeat(&env, symbol_to_asset_id(&pool));
+        Self::_record_heartbeat(&env, pool);
         Ok(())
     }
 
@@ -966,7 +966,7 @@ impl TimeLockedUpgradeContract {
         }
     }
 
-    fn _resolve_feed_metrics(env: &Env, asset: &AssetId) -> AssetFeedMetrics {
+    fn _resolve_feed_metrics(env: &Env, asset: &Symbol) -> AssetFeedMetrics {
         let pool = Self::get_corridor_fee_pool(env.clone(), asset.clone());
         let stored: AssetFeedMetrics = env
             .storage()
