@@ -65,9 +65,11 @@ pub const PROFILE_TTL_THRESHOLD: u32 = 10_000;
 
 pub fn get_node_profiles(env: &Env) -> Map<Address, NodeProfile> {
     let key = Symbol::new(env, "NODES");
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PROFILE_TTL_THRESHOLD, env.storage().max_ttl());
+    if env.storage().persistent().has(&key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PROFILE_TTL_THRESHOLD, env.storage().max_ttl());
+    }
     env.storage()
         .persistent()
         .get(&key)
