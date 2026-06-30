@@ -714,7 +714,12 @@ impl TimeLockedUpgradeContract {
             return Err(ContractError::InsufficientStakeForTier);
         }
 
-        env.storage().persistent().set(&feed_key, &amount);
+        let stake_val = storage::FeedStakeValue {
+            amount,
+            last_active: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&feed_key, &stake_val);
+        env.storage().persistent().extend_ttl(&feed_key, storage::RENT_THRESHOLD, storage::RENT_EXTEND_TO);
 
         let stake_key = StakeKey(node.clone());
         let node_total: u64 = env.storage().instance().get(&stake_key).unwrap_or(0);
@@ -752,11 +757,12 @@ impl TimeLockedUpgradeContract {
 
         let feed_key = FeedStakeKey(node.clone(), asset.clone());
         let feed_key = StakingStorageKey::FeedStake(node.clone(), asset);
-        let amount: u64 = env
+        let stake_val: storage::FeedStakeValue = env
             .storage()
             .persistent()
             .get(&feed_key)
             .ok_or(ContractError::NotRegistered)?;
+        let amount = stake_val.amount;
 
         env.storage().persistent().remove(&feed_key);
 
@@ -785,7 +791,10 @@ impl TimeLockedUpgradeContract {
     pub fn get_feed_stake(env: Env, node: Address, asset: Symbol) -> u64 {
         let feed_key = FeedStakeKey(node, asset);
     pub fn get_feed_stake(env: Env, node: Address, asset: AssetId) -> u64 {
-        env.storage()
+        storage::check_and_prune_feed_stake(&env, node.clone(), asset);
+        let feed_key = StakingStorageKey::FeedStake(node, asset);
+        let stake_val: Option<storage::FeedStakeValue> = env
+            .storage()
             .persistent()
             .get(&feed_key)
             .unwrap_or(0)
@@ -1110,7 +1119,9 @@ impl TimeLockedUpgradeContract {
 
         check_bond_capacity(&env, &node, &pool)?;
 
-        Self::_record_heartbeat(&env, symbol_to_asset_id(&pool));
+        let asset_id = symbol_to_asset_id(&pool);
+        storage::update_feed_stake_activity(&env, node.clone(), asset_id);
+        Self::_record_heartbeat(&env, asset_id);
         Ok(())
     }
 
