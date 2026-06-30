@@ -1,5 +1,8 @@
 use crate::{AssetId, ContractError, TimeLockedUpgradeContract};
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, Address, Env, Vec};
+
+pub const STANDARD_FIXED_POINT_SCALE: i128 = 10_000_000;
+pub const INTERIOR_FEE_PRECISION_SCALE: i128 = 100_000_000_000_000;
 
 // ---------------------------------------------------------------------------
 // Asset pricing storage (general — unchanged)
@@ -101,90 +104,108 @@ pub fn get_corridor_fee_pool(env: Env, asset: AssetId) -> CorridorFeePool {
         .unwrap_or(CorridorFeePool::new(asset))
 }
 
-// ---------------------------------------------------------------------------
-// Corridor weight profile functions — independent access control (issue #530)
-// ---------------------------------------------------------------------------
+pub fn distribute_variable_fee_pool(
+    env: &Env,
+    variable_pool: u64,
+    relayer_weights: Vec<u64>,
+) -> Result<Vec<u64>, ContractError> {
+    let total_weight = relayer_weights
+        .iter()
+        .try_fold(0_i128, |acc, weight| {
+            acc.checked_add(weight as i128)
+                .ok_or(ContractError::Overflow)
+        })?;
 
-/// Set or update the corridor weight profile for an asset.
-/// Uses its own admin check so weight edits are gated independently
-/// from fee pool writes.
-pub fn set_corridor_weight(
-    env: Env,
-    admin: Address,
-    asset: AssetId,
-    base_weight: u64,
-    dynamic_weight: u64,
-) -> Result<CorridorWeightProfile, ContractError> {
-    admin.require_auth();
-    let data = TimeLockedUpgradeContract::get_data(env.clone())?;
-    if data.admin != admin {
-        return Err(ContractError::NotAdmin);
+    let mut profiles = Vec::new(env);
+    if total_weight == 0 || relayer_weights.len() == 0 {
+        return Ok(profiles);
     }
-    let key = CorridorWeightKey::Profile(asset.clone());
-    let profile = CorridorWeightProfile {
-        asset: asset.clone(),
-        base_weight,
-        dynamic_weight,
-    };
-    env.storage().persistent().set(&key, &profile);
-    Ok(profile)
-}
 
-/// Read the corridor weight profile for an asset.
-pub fn get_corridor_weight(env: Env, asset: AssetId) -> CorridorWeightProfile {
-    let key = CorridorWeightKey::Profile(asset.clone());
-    env.storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(CorridorWeightProfile::new(asset))
+    let pool_profile = (variable_pool as i128)
+        .checked_mul(STANDARD_FIXED_POINT_SCALE)
+        .ok_or(ContractError::Overflow)?;
+    let interior_pool_profile = pool_profile
+        .checked_mul(INTERIOR_FEE_PRECISION_SCALE)
+        .ok_or(ContractError::Overflow)?;
+
+    let last_index = relayer_weights.len() - 1;
+    let mut assigned_profile = 0_i128;
+
+    for index in 0..relayer_weights.len() {
+        let profile = if index == last_index {
+            pool_profile
+                .checked_sub(assigned_profile)
+                .ok_or(ContractError::Overflow)?
+        } else {
+            let weight = relayer_weights
+                .get(index)
+                .ok_or(ContractError::Overflow)? as i128;
+            let interior_share = interior_pool_profile
+                .checked_mul(weight)
+                .ok_or(ContractError::Overflow)?
+                .checked_div(total_weight)
+                .ok_or(ContractError::DivisionByZero)?;
+            interior_share
+                .checked_div(INTERIOR_FEE_PRECISION_SCALE)
+                .ok_or(ContractError::DivisionByZero)?
+        };
+
+        assigned_profile = assigned_profile
+            .checked_add(profile)
+            .ok_or(ContractError::Overflow)?;
+        profiles.push_back(profile.try_into().map_err(|_| ContractError::Overflow)?);
+    }
+
+    Ok(profiles)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TimeLockedUpgradeContractClient;
-    use soroban_sdk::testutils::Address as _;
 
-    fn setup() -> (Env, TimeLockedUpgradeContractClient<'static>, Address, Address) {
+    #[test]
+    fn fee_distribution_normalizes_to_standard_fixed_point_footprint() {
         let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
-        let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let attacker = Address::generate(&env);
-        client.initialize(&admin, &treasury);
-        (env, client, admin, attacker)
+        let mut weights = Vec::new(&env);
+        weights.push_back(1);
+        weights.push_back(1);
+        weights.push_back(1);
+
+        let profiles = distribute_variable_fee_pool(&env, 1, weights).unwrap();
+
+        assert_eq!(profiles.get(0), Some(3_333_333));
+        assert_eq!(profiles.get(1), Some(3_333_333));
+        assert_eq!(profiles.get(2), Some(3_333_334));
+        assert_eq!(
+            profiles.iter().fold(0_u64, |acc, value| acc + value),
+            STANDARD_FIXED_POINT_SCALE as u64
+        );
     }
 
     #[test]
-    fn corridor_weight_profile_is_isolated_from_fee_pool() {
-        let (_, client, admin, _) = setup();
-        let asset = 3897123275;
+    fn fee_distribution_preserves_fractional_weight_balance() {
+        let env = Env::default();
+        let mut weights = Vec::new(&env);
+        weights.push_back(2);
+        weights.push_back(3);
+        weights.push_back(5);
 
-        let pool = client.add_corridor_fees(&admin, &asset, &1_000, &25);
-        assert_eq!(pool.collected, 1_000);
-        assert_eq!(pool.variable_pool, 25);
+        let profiles = distribute_variable_fee_pool(&env, 7, weights).unwrap();
 
-        let profile = client.set_corridor_weight(&admin, &asset, &70, &30);
-        assert_eq!(profile.asset, asset);
-        assert_eq!(profile.base_weight, 70);
-        assert_eq!(profile.dynamic_weight, 30);
-
-        let unchanged_pool = client.get_corridor_fee_pool(&asset);
-        assert_eq!(unchanged_pool.collected, 1_000);
-        assert_eq!(unchanged_pool.variable_pool, 25);
-
-        let stored_profile = client.get_corridor_weight(&asset);
-        assert_eq!(stored_profile.base_weight, 70);
-        assert_eq!(stored_profile.dynamic_weight, 30);
+        assert_eq!(profiles.get(0), Some(14_000_000));
+        assert_eq!(profiles.get(1), Some(21_000_000));
+        assert_eq!(profiles.get(2), Some(35_000_000));
+        assert_eq!(profiles.iter().fold(0_u64, |acc, value| acc + value), 70_000_000);
     }
 
     #[test]
-    fn non_admin_cannot_edit_corridor_weight_profile() {
-        let (_, client, _, attacker) = setup();
-        let result = client.try_set_corridor_weight(&attacker, &2654435761, &40, &60);
+    fn fee_distribution_rejects_overflow_before_division() {
+        let env = Env::default();
+        let mut weights = Vec::new(&env);
+        weights.push_back(u64::MAX);
 
-        assert_eq!(result, Err(Ok(ContractError::NotAdmin)));
+        let result = distribute_variable_fee_pool(&env, u64::MAX, weights);
+
+        assert_eq!(result, Err(ContractError::Overflow));
     }
 }
