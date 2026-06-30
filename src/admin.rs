@@ -25,6 +25,59 @@ fn revocation_threshold(env: &Env) -> u32 {
 pub(crate) const PENDING_OWNER_KEY: Symbol = symbol_short!("PNDOWN");
 pub(crate) const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 
+// ── Per-action admin nonce map ────────────────────────────────────────────────
+
+/// Discriminates which admin action's independent nonce sequence is being
+/// advanced.  Each variant carries its own isolated per-caller counter so that
+/// consuming a nonce for one action cannot accidentally satisfy or advance the
+/// counter for any other action.
+#[contracttype]
+#[derive(Clone)]
+pub enum AdminAction {
+    ProposeOwnershipTransfer,
+    ClaimOwnership,
+    SetPaused,
+    ProposeEmergencyRevocation,
+    VoteEmergencyRevocation,
+}
+
+/// Composite persistent-storage key that maps a `(caller, action)` pair to its
+/// current nonce value.  Stored in persistent storage so that nonce state
+/// survives TTL extensions and is never silently reset.
+#[contracttype]
+#[derive(Clone)]
+enum AdminNonceKey {
+    Action(Address, AdminAction),
+}
+
+/// Returns the next expected nonce for `caller` on the given `action`.
+/// Returns `0` when no nonce has been consumed yet for this pair.
+pub fn get_admin_action_nonce(env: &Env, caller: &Address, action: AdminAction) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&AdminNonceKey::Action(caller.clone(), action))
+        .unwrap_or(0u64)
+}
+
+/// Verifies that `incoming == expected` for this `(caller, action)` pair and
+/// atomically advances the stored counter to `expected + 1`.
+///
+/// Returns [`ContractError::InvalidNonce`] when the nonce does not match.
+fn consume_admin_nonce(
+    env: &Env,
+    caller: &Address,
+    action: AdminAction,
+    incoming: u64,
+) -> Result<(), ContractError> {
+    let key = AdminNonceKey::Action(caller.clone(), action);
+    let expected: u64 = env.storage().persistent().get(&key).unwrap_or(0u64);
+    if incoming != expected {
+        return Err(ContractError::InvalidNonce);
+    }
+    env.storage().persistent().set(&key, &(expected + 1u64));
+    Ok(())
+}
+
 // ── Emergency key revocation ─────────────────────────────────────────────
 // NOTE: Emergency revocation proposals are now stored in temporary storage
 // via EMERGENCY_REVOCATION_TEMP_KEY. The persistent EMERGENCY_REVOCATION_KEY
@@ -220,6 +273,7 @@ pub fn propose_admin_change(
     if data.admin != voter && !is_signer {
         return Err(ContractError::Unauthorized);
     }
+    consume_admin_nonce(env, &voter, AdminAction::VoteEmergencyRevocation, nonce)?;
 
     // ── CHANGED: Retrieve from temporary storage instead of persistent ──
     let mut proposal: EmergencyRevocationProposal = get_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY)

@@ -882,6 +882,7 @@ impl TimeLockedUpgradeContract {
         env: Env,
         voter: Address,
         sig_expires_at: u64,
+        nonce: u64,
     ) -> Result<(), ContractError> {
         // Guard: a revoked coordinaadmin::a    admin::vote_emergency_revocation(&env, voter, sig_expires_at)
     }
