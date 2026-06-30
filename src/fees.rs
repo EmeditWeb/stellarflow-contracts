@@ -4,6 +4,10 @@ use soroban_sdk::{contracttype, Address, Env, Vec};
 pub const STANDARD_FIXED_POINT_SCALE: i128 = 10_000_000;
 pub const INTERIOR_FEE_PRECISION_SCALE: i128 = 100_000_000_000_000;
 
+// ---------------------------------------------------------------------------
+// Asset pricing storage (general — unchanged)
+// ---------------------------------------------------------------------------
+
 #[contracttype]
 #[derive(Clone)]
 pub struct CorridorFeePool {
@@ -27,6 +31,41 @@ impl CorridorFeePool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Corridor weight profile — separated from asset pricing entries (issue #530)
+// ---------------------------------------------------------------------------
+
+/// Dedicated profile holding dynamic corridor weight variables.
+/// Kept in its own storage key so audits and state updates never
+/// touch the general asset pricing block.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CorridorWeightProfile {
+    pub asset: AssetId,
+    pub base_weight: u64,
+    pub dynamic_weight: u64,
+}
+
+/// Separate storage namespace for corridor weight profiles.
+#[contracttype]
+pub enum CorridorWeightKey {
+    Profile(AssetId),
+}
+
+impl CorridorWeightProfile {
+    fn new(asset: AssetId) -> Self {
+        Self {
+            asset,
+            base_weight: 0,
+            dynamic_weight: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fee pool functions (unchanged behaviour)
+// ---------------------------------------------------------------------------
+
 pub fn add_corridor_fees(
     env: Env,
     admin: Address,
@@ -35,18 +74,16 @@ pub fn add_corridor_fees(
     variable_fee: u64,
 ) -> Result<CorridorFeePool, ContractError> {
     admin.require_auth();
-    let data = TimeLockedUpgradeContract::get_data(&env)?;
+    let data = TimeLockedUpgradeContract::get_data(env.clone())?;
     if data.admin != admin {
         return Err(ContractError::NotAdmin);
     }
-
     let key = FeesStorageKey::CorridorPool(asset.clone());
     let mut pool: CorridorFeePool = env
         .storage()
         .instance()
         .get(&key)
         .unwrap_or(CorridorFeePool::new(asset.clone()));
-
     pool.collected = pool
         .collected
         .checked_add(collected)
@@ -55,7 +92,6 @@ pub fn add_corridor_fees(
         .variable_pool
         .checked_add(variable_fee)
         .ok_or(ContractError::Overflow)?;
-
     env.storage().instance().set(&key, &pool);
     Ok(pool)
 }

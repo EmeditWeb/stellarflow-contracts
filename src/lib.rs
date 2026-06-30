@@ -188,20 +188,6 @@ pub struct NodeProfile {
 }
 
 #[contracttype]
-#[derive(Clone)]
-pub struct CorridorFeePool {
-    pub asset: AssetId,
-    pub collected: u64,
-    pub variable_pool: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub enum CorridorFeeKey {
-    Asset(AssetId),
-}
-
-#[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeedStakeRecord {
     pub node: Address,
@@ -583,30 +569,35 @@ impl TimeLockedUpgradeContract {
         env.storage().persistent().set(&fee_key, &pool);
     pub fn add_corridor_fees(
         env: Env,
+        admin: Address,
         asset: AssetId,
         collected: u64,
         variable_fee: u64,
-    ) -> Result<CorridorFeePool, ContractError> {
-        let key = CorridorFeeKey::Asset(asset);
-        let mut pool: CorridorFeePool =
-            env.storage()
-                .persistent()
-                .get(&key)
-                .unwrap_or(CorridorFeePool {
-                    asset,
-                    collected: 0,
-                    variable_pool: 0,
-                });
-        pool.collected = pool
-            .collected
-            .checked_add(collected)
-            .ok_or(ContractError::Overflow)?;
-        pool.variable_pool = pool
-            .variable_pool
-            .checked_add(variable_fee)
-            .ok_or(ContractError::Overflow)?;
-        env.storage().persistent().set(&key, &pool);
+    ) -> Result<fees::CorridorFeePool, ContractError> {
+        let pool = fees::add_corridor_fees(env.clone(), admin, asset, collected, variable_fee)?;
+        Self::_extend_instance_ttl(&env);
         Ok(pool)
+    }
+
+    pub fn get_corridor_fee_pool(env: Env, asset: AssetId) -> fees::CorridorFeePool {
+        fees::get_corridor_fee_pool(env, asset)
+    }
+
+    pub fn set_corridor_weight(
+        env: Env,
+        admin: Address,
+        asset: AssetId,
+        base_weight: u64,
+        dynamic_weight: u64,
+    ) -> Result<fees::CorridorWeightProfile, ContractError> {
+        let profile =
+            fees::set_corridor_weight(env.clone(), admin, asset, base_weight, dynamic_weight)?;
+        Self::_extend_instance_ttl(&env);
+        Ok(profile)
+    }
+
+    pub fn get_corridor_weight(env: Env, asset: AssetId) -> fees::CorridorWeightProfile {
+        fees::get_corridor_weight(env, asset)
     }
 
     // ── Dynamic Staking Tier Assignment (Issue #300) ─────────────────────────
@@ -895,7 +886,6 @@ impl TimeLockedUpgradeContract {
         // Guard: a revoked coordinaadmin::a    admin::vote_emergency_revocation(&env, voter, sig_expires_at)
     }
 
-    /// Returns the active emergency revocation proposal, if one exists.
     pub fn get_emergency_revocation(
         env: Env,
     ) -> Option<admin::EmergencyRevocationProposal> {
@@ -1094,7 +1084,7 @@ impl TimeLockedUpgradeContract {
                 volume_score: 10,
                 volatility_bps: 100,
             });
-        let corridor = Self::get_corridor_fee_pool(env.clone(), *asset);
+        let corridor = fees::get_corridor_fee_pool(env.clone(), *asset);
         AssetFeedMetrics {
             volume_score: effective_volume_score(stored.volume_score, corridor.collected),
             volatility_bps: stored.volatility_bps,
