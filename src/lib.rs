@@ -618,17 +618,21 @@ impl TimeLockedUpgradeContract {
     // ── Dynamic Staking Tier Assignment (Issue #300) ─────────────────────────
 
     /// Configure the minimum stake required for each collateral tier.
+    /// Requires multi-signature consensus (≥ 2 valid signers) for cross-border
+    /// parameter changes — issue #539.
     pub fn set_staking_tier_config(
         env: Env,
         admin: Address,
         config: StakingTierConfig,
-        _signers: Vec<Address>,
+        signers: Vec<Address>,
     ) -> Result<(), ContractError> {
         let data = Self::_load_data(&env)?;
         if data.admin != admin {
             return Err(ContractError::NotAdmin);
         }
         admin.require_auth();
+        // Issue #539: enforce multi-sig consensus before committing.
+        crate::auth::require_multisig(&env, &signers)?;
         validate_tier_config(&config)?;
         env.storage()
             .instance()
@@ -646,19 +650,23 @@ impl TimeLockedUpgradeContract {
     }
 
     /// Set the volume and volatility profile for a currency feed.
+    /// Requires multi-signature consensus (≥ 2 valid signers) for cross-border
+    /// parameter changes — issue #539.
     pub fn set_asset_feed_metrics(
         env: Env,
         admin: Address,
         asset: AssetId,
         volume_score_floor: u32,
         volatility_bps: u32,
-        _signers: Vec<Address>,
+        signers: Vec<Address>,
     ) -> Result<AssetFeedMetrics, ContractError> {
         let data = Self::_load_data(&env)?;
         if data.admin != admin {
             return Err(ContractError::NotAdmin);
         }
         admin.require_auth();
+        // Issue #539: enforce multi-sig consensus before committing.
+        crate::auth::require_multisig(&env, &signers)?;
 
         let metrics = AssetFeedMetrics {
             volume_score: volume_score_floor.min(100),
