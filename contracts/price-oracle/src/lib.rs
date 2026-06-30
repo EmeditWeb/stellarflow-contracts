@@ -569,6 +569,98 @@ pub enum ContractError {
     NotCoordinator = 15,
     /// The circuit-breaker is not currently active; nothing to reset.
     CircuitBreakerNotActive = 16,
+    /// Submitted price value is negative, zero, or otherwise invalid.
+    InvalidPrice = 17,
+    /// Arithmetic overflow during price math (e.g. weighted-index calculation).
+    PriceMathOverflow = 18,
+    /// Asset weight is zero, which would produce a division-by-zero.
+    InvalidWeight = 19,
+    /// Batch operation exceeds the maximum allowed asset count.
+    TooManyAssets = 20,
+    /// Pool liquidity reported by the provider is below the configured threshold.
+    LiquidityBelowThreshold = 21,
+    /// Liquidity value is negative or zero — cannot be used for validation.
+    InvalidLiquidity = 22,
+    /// Contract has been self-destructed and is permanently unusable.
+    ContractDestroyed = 23,
+    /// Contract has not been initialized yet.
+    NotInitialized = 24,
+    /// Price data exceeds the maximum allowed age.
+    StaleRateData = 25,
+    /// Reentrancy detected — call stack already inside this contract.
+    ReentrancyDetected = 26,
+    /// Provider submitted another price update too soon (ledger gap too small).
+    LedgerGapTooSmall = 27,
+    /// Price is below the configured absolute floor.
+    PriceOutOfBounds = 28,
+    /// Contract or admin is already initialized.
+    AlreadyInitialized = 29,
+    /// Emergency halt is active — all price reads are blocked.
+    EmergencyHalted = 30,
+    /// No admin address has been set in storage.
+    AdminNotSet = 31,
+    /// No pending admin transfer found.
+    PendingAdminNotFound = 32,
+    /// Caller is not the pending admin.
+    NotPendingAdmin = 33,
+    /// Pending admin timestamp is missing from storage.
+    PendingAdminTimestampMissing = 34,
+    /// Admin timelock period has not elapsed yet.
+    AdminTimelockNotExpired = 35,
+    /// Fee token address has not been configured.
+    FeeTokenNotSet = 36,
+    /// Query fee amount must be non-negative.
+    InvalidQueryFee = 37,
+    /// No reward balance available to claim.
+    NoRewards = 38,
+    /// Fee vault does not hold enough balance to cover the withdrawal.
+    InsufficientVaultBalance = 39,
+    /// Normalized price is zero or negative after decimal adjustment.
+    InvalidNormalizedPrice = 40,
+    /// Caller is not an authorized admin.
+    NotAuthorized = 41,
+    /// Caller is not an authorized provider/relayer.
+    ProviderNotAuthorized = 42,
+    /// Caller is not the Community Council.
+    CouncilRequired = 43,
+    /// Contract is in emergency freeze state.
+    ContractFrozen = 44,
+    /// Price deviation exceeds the configured maximum (flash crash protection).
+    FlashCrashDetected = 45,
+    /// Price floor value is invalid (zero, negative, or above max bound).
+    InvalidPriceFloor = 46,
+    /// No previous configuration snapshot to roll back to.
+    NoPreviousConfig = 47,
+    /// Price bounds are invalid (min >= max, zero, or negative).
+    InvalidPriceBounds = 48,
+    /// Max deviation percentage is outside the valid governance range.
+    InvalidMaxDeviation = 49,
+    /// Multi-signature validation failed (duplicate admins, insufficient count, etc.).
+    MultiSigValidationFailed = 50,
+    /// Action type code is unrecognized or not supported in the current context.
+    InvalidActionType = 51,
+    /// The referenced proposed action does not exist.
+    ActionNotFound = 52,
+    /// The proposed action has already been executed.
+    ActionAlreadyExecuted = 53,
+    /// The proposed action has been cancelled.
+    ActionCancelled = 54,
+    /// Governance vote quorum was not reached.
+    QuorumNotReached = 55,
+    /// Delegate address must differ from the owner address.
+    InvalidDelegate = 56,
+    /// Liquidity threshold is outside the valid range.
+    InvalidLiquidityThreshold = 57,
+    /// Slash or stake amount is zero or negative.
+    InvalidSlashAmount = 58,
+    /// Slash token contract address has not been configured.
+    SlashTokenNotSet = 59,
+    /// Provider's staked balance is insufficient for the requested operation.
+    InsufficientStake = 60,
+    /// Admin weight value is outside the allowed range (1–100).
+    InvalidAdminWeight = 61,
+    /// Weight threshold value is invalid (below minimum or above maximum).
+    InvalidWeightThreshold = 62,
 }
 
 pub type Error = ContractError;
@@ -4411,7 +4503,6 @@ pub mod admin;
 mod delegate_tests;
 pub mod math;
 mod median;
-mod slashing;
 pub mod slashing;
 mod test;
 mod types;

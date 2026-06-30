@@ -161,10 +161,13 @@ mod tests {
 //! | `DataKey::ProviderReportedLiquidity(Address, Symbol)` | `i128` | Last reported liquidity by provider for asset |
 //! | `DataKey::LastLiquidityValidation(Symbol)` | `u64` | Timestamp of last successful validation |
 
-use soroban_sdk::{Address, Env, Symbol};
+use soroban_sdk::{Address, Env, Symbol, Vec};
 
-use crate::types::DataKey;
+use crate::types::{AssetWeight, DataKey};
 use crate::ContractError;
+
+/// Re-exported from lib.rs — maximum assets allowed in a single `clear_assets` batch.
+const MAX_CLEAR_ASSETS: u32 = 20;
 
 /// Minimum allowed liquidity threshold (1 XLM equivalent = 10_000_000 stroops).
 /// Prevents admins from setting unreasonably low thresholds that defeat the purpose.
@@ -196,6 +199,29 @@ fn set_liquidity_threshold(env: &Env, asset: &Symbol, threshold: i128) {
     env.storage()
         .persistent()
         .set(&DataKey::LiquidityThreshold(asset.clone()), &threshold);
+}
+
+/// Public admin-facing wrapper for setting the liquidity threshold.
+/// Validates that the threshold is within the allowed range and persists it.
+/// Returns `Err(ContractError::InvalidLiquidityThreshold)` if out of range.
+pub fn set_liquidity_threshold_internal(
+    env: &Env,
+    asset: &Symbol,
+    threshold: i128,
+) -> Result<(), ContractError> {
+    if threshold < MIN_LIQUIDITY_THRESHOLD || threshold > MAX_LIQUIDITY_THRESHOLD {
+        return Err(ContractError::InvalidLiquidityThreshold);
+    }
+    set_liquidity_threshold(env, asset, threshold);
+    Ok(())
+}
+
+/// Remove the liquidity threshold for an asset.
+/// After removal, liquidity validation is disabled for this asset.
+pub fn remove_liquidity_threshold_internal(env: &Env, asset: &Symbol) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::LiquidityThreshold(asset.clone()));
 }
 
 /// Read the last reported liquidity from a specific provider for an asset.
