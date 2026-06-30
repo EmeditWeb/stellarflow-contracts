@@ -109,6 +109,9 @@ pub enum ContractError {
     StaleSequence = 28,
     /// A price-variance configuration field violated one or more struct invariants.
     InvalidVarianceConfig = 33,
+    /// Fewer than the minimum number of independent validator nodes supplied
+    /// parameters during the current block round.
+    IncompleteQuorum = 34,
 }
 
 // Contract state keys
